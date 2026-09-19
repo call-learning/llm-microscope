@@ -1,0 +1,32 @@
+[project]
+name = "llm-microscope"
+version = "0.2.0"
+description = "A local, modular LLM interpretability workbench for Qwen and similar Hugging Face models"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "accelerate>=1.2",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "plotly>=5.24",
+  "safetensors>=0.4",
+  "scikit-learn>=1.5",
+  "streamlit>=1.41",
+  "transformers>=4.51,<6",
+]
+
+[project.optional-dependencies]
+captum = ["captum>=0.7"]
+umap = ["umap-learn>=0.5"]
+nnsight = ["nnsight>=0.4"]
+transformer-lens = ["transformer-lens>=2.15"]
+all = [
+  "captum>=0.7",
+  "umap-learn>=0.5",
+  "nnsight>=0.4",
+  "transformer-lens>=2.15",
+]
+
+[tool.uv]
+package = false
+
