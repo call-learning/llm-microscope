@@ -133,6 +133,49 @@ def cosine_by_layer(a: AnalysisResult, b: AnalysisResult) -> pd.DataFrame:
     )
 
 
+@dataclass
+class BatchResult:
+    input_ids: torch.Tensor
+    hidden_states: tuple[torch.Tensor, ...]
+    logits: torch.Tensor
+
+
+def analyse_batch(
+    runtime: Runtime,
+    prompts: list[str],
+    max_length: int = 128,
+) -> BatchResult:
+    """Tokenize a list of prompts and run a single batched forward pass.
+
+    Returns hidden states and logits for the whole batch without the
+    single-prompt ``labels`` field. Use this for probe training data where
+    you need hidden states for many prompts at once.
+    """
+    if not prompts:
+        raise ValueError("At least one prompt is required.")
+    batch = runtime.tokenizer(
+        prompts,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_length,
+        padding=True,
+        add_special_tokens=True,
+    ).to(runtime.device)
+    with torch.inference_mode():
+        outputs = runtime.model(
+            **batch,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+    hidden = tuple(t.detach().float().cpu() for t in outputs.hidden_states)
+    return BatchResult(
+        input_ids=batch["input_ids"].detach().cpu(),
+        hidden_states=hidden,
+        logits=outputs.logits.detach().float().cpu(),
+    )
+
+
 def reduce_activations(
     result: AnalysisResult,
     layer: int,

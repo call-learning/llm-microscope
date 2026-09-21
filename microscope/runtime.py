@@ -111,6 +111,26 @@ def token_labels(runtime: Runtime, input_ids: torch.Tensor) -> list[str]:
     return labels
 
 
+def layer_modules(layer: Any) -> tuple[Any, Any]:
+    """Return (attn_module, mlp_module) for a decoder layer, or (None, None).
+
+    Follows the common per-layer submodule convention used by Llama, Qwen,
+    and Mistral models: ``layer.self_attn`` and ``layer.mlp``. Architectures
+    that do not follow this convention (e.g. GPT-2, which nests attention
+    and MLP inside a single ``layer.h`` block) return ``(None, None)`` so
+    that the caller can fall back to residual-stream patching only.
+    """
+    attn = getattr(layer, "self_attn", None)
+    if attn is None:
+        attn = getattr(layer, "attention", None)
+    mlp = getattr(layer, "mlp", None)
+    if mlp is None:
+        mlp = getattr(layer, "mlp_module", None)
+    if attn is None and mlp is None:
+        return (None, None)
+    return (attn, mlp)
+
+
 def cuda_stats() -> dict[str, str]:
     if not torch.cuda.is_available():
         return {"Device": "CPU"}

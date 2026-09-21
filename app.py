@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -14,8 +15,20 @@ from microscope.analysis import (
     reduce_activations,
     top_tokens,
 )
-from microscope.interventions import gradient_x_input, patch_final_residual
-from microscope.runtime import cuda_stats, load_runtime
+from microscope.interventions import (
+    PatchTarget,
+    gradient_x_input,
+    mean_ablation,
+    patch_final_residual,
+    patching_score_curve,
+)
+from microscope.probing import (
+    ProbeResult,
+    fit_probes,
+    generate_concept_labels,
+    generate_quick_labels,
+)
+from microscope.runtime import cuda_stats, layer_modules, load_runtime
 from microscope.toolbox import installed_tools, nnsight_status, transformer_lens_probe
 
 
@@ -80,6 +93,7 @@ tabs = st.tabs(
         "Compare A/B",
         "Patching",
         "Attribution",
+        "Linear Probe",
         "Toolbox",
     ]
 )
@@ -173,27 +187,115 @@ with tabs[4]:
             st.error(f"Comparison failed: {type(exc).__name__}: {exc}")
 
 with tabs[5]:
-    st.subheader("Causal residual-stream patching")
-    st.caption("Copies the final-token state after one source layer into the same layer of the target run.")
+    st.subheader("Causal patching & ablation")
+    st.caption("Copies or ablates the final-token state at a layer. Residual patching works on all architectures; attention/MLP output patching requires the self_attn/mlp convention.")
+
+    # Check module availability
+    first_layer = runtime.layers[0]
+    attn_mod, mlp_mod = layer_modules(first_layer)
+    modules_available = attn_mod is not None and mlp_mod is not None
+
+    target_options = ["Residual"]
+    if modules_available:
+        target_options += ["Attention output", "MLP output"]
+    target_label = st.selectbox("Patch target", target_options)
+    target_map = {
+        "Residual": PatchTarget.RESIDUAL,
+        "Attention output": PatchTarget.ATTN_OUTPUT,
+        "MLP output": PatchTarget.MLP_OUTPUT,
+    }
+    target = target_map[target_label]
+
+    if not modules_available and target_label != "Residual":
+        st.warning("Module-level patching is unavailable for this architecture. Falling back to residual.")
+        target = PatchTarget.RESIDUAL
+
     source = st.text_area("Source prompt", "The capital of France is", key="patch_source")
-    target = st.text_area("Target prompt", "The capital of Germany is", key="patch_target")
-    patch_layer = st.slider("Layer to patch", 0, len(runtime.layers) - 1, len(runtime.layers) // 2)
-    if st.button("Run patching experiment"):
-        try:
-            baseline, patched = patch_final_residual(
-                runtime,
-                source,
-                target,
-                patch_layer,
-                max_length=max_length,
+    target_prompt = st.text_area("Target prompt", "The capital of Germany is", key="patch_target")
+
+    # Head selector for attention output
+    head_idx = 0
+    if target is PatchTarget.ATTN_OUTPUT and modules_available:
+        # Determine n_heads from the model config
+        cfg = runtime.model.config
+        n_heads = getattr(cfg, "num_attention_heads", 16)
+        head_idx = st.slider("Query head", 0, n_heads - 1, 0)
+
+    # Mode: single-layer or score curve
+    mode = st.radio("Mode", ["Single layer", "Score curve (all layers)"], horizontal=True)
+
+    if mode == "Single layer":
+        patch_layer = st.slider("Layer to patch", 0, len(runtime.layers) - 1, len(runtime.layers) // 2)
+
+        # Ablation mode
+        ablation_mode = st.radio("Ablation", ["Off (patch)", "Zero", "Mean"], horizontal=True)
+
+        if st.button("Run patching experiment"):
+            try:
+                if ablation_mode == "Off (patch)":
+                    if target is PatchTarget.RESIDUAL:
+                        baseline, patched = patch_final_residual(
+                            runtime, source, target_prompt, patch_layer, max_length=max_length,
+                        )
+                    else:
+                        # Use score curve for single layer with non-residual target
+                        curve = patching_score_curve(
+                            runtime, source, target_prompt, target,
+                            max_length=max_length, head_idx=head_idx,
+                        )
+                        row = curve[curve["layer"] == patch_layer].iloc[0]
+                        baseline_df = pd.DataFrame([{
+                            "rank": 1,
+                            "token": repr(row["baseline_top1_token"]),
+                            "token_id": -1,
+                            "probability": row["baseline_top1_prob"],
+                        }])
+                        patched_df = pd.DataFrame([{
+                            "rank": 1,
+                            "token": repr(row["patched_top1_token"]),
+                            "token_id": -1,
+                            "probability": row["patched_top1_prob"],
+                        }])
+                else:
+                    ab_mode = "zero" if ablation_mode == "Zero" else "mean"
+                    baseline, patched = mean_ablation(
+                        runtime, source, target_prompt, patch_layer,
+                        target, mode=ab_mode, max_length=max_length,
+                    )
+                left, right = st.columns(2)
+                left.write("Baseline target")
+                left.dataframe(baseline, width="stretch", hide_index=True)
+                right.write(f"After {'ablation' if ablation_mode != 'Off (patch)' else 'source → target patch'}")
+                right.dataframe(patched, width="stretch", hide_index=True)
+            except Exception as exc:
+                st.error(f"Patching failed: {type(exc).__name__}: {exc}")
+
+    else:  # Score curve
+        curve_metric = st.radio("Curve metric", ["Logit delta", "Probability delta"], horizontal=True)
+        if st.button("Run score curve"):
+            with st.spinner("Running patching score curve (1 source + 1 baseline + N patched forwards)…"):
+                try:
+                    curve = patching_score_curve(
+                        runtime, source, target_prompt, target,
+                        max_length=max_length, head_idx=head_idx,
+                    )
+                    st.session_state["patch_curve"] = curve
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    st.error("CUDA ran out of memory. Shorten the prompt or use a smaller model.")
+                except Exception as exc:
+                    st.error(f"Score curve failed: {type(exc).__name__}: {exc}")
+
+        curve = st.session_state.get("patch_curve")
+        if curve is not None:
+            y_col = "delta_logit" if curve_metric == "Logit delta" else "delta_prob"
+            st.plotly_chart(
+                px.line(curve, x="layer", y=y_col, markers=True,
+                        title=f"Patching score curve ({target_label})"),
+                width="stretch",
             )
-            left, right = st.columns(2)
-            left.write("Baseline target")
-            left.dataframe(baseline, width="stretch", hide_index=True)
-            right.write("After source → target patch")
-            right.dataframe(patched, width="stretch", hide_index=True)
-        except Exception as exc:
-            st.error(f"Patching failed: {type(exc).__name__}: {exc}")
+            st.subheader("Per-layer detail")
+            st.dataframe(curve, width="stretch", hide_index=True)
 
 with tabs[6]:
     st.subheader("Gradient × input attribution")
@@ -219,6 +321,79 @@ with tabs[6]:
             st.error(f"Attribution failed: {type(exc).__name__}: {exc}")
 
 with tabs[7]:
+    st.subheader("Linear Probe")
+    st.caption("Fits a binary L2 logistic regression on the final-token hidden state at each layer. Shows where a property becomes linearly decodable.")
+
+    probe_mode = st.radio("Label mode", ["Concept (contrastive)", "Quick (substring)"], horizontal=True)
+
+    prompts: list[str] = []
+    labels: list[int] = []
+
+    if probe_mode == "Concept (contrastive)":
+        pos_template = st.text_input("Positive template", "The capital of {X} is")
+        neg_template = st.text_input("Negative template", "The largest city in {X} is")
+        fill_values = st.text_input("Fill values (comma-separated)", "France, Germany, Japan, Spain, Italy, Brazil")
+        if st.button("Fit probe (concept)"):
+            try:
+                prompts, labels = generate_concept_labels(pos_template, neg_template, fill_values)
+                with st.spinner(f"Fitting probe on {len(prompts)} prompts…"):
+                    probe_result: ProbeResult = fit_probes(runtime, prompts, labels, C=st.session_state.get("probe_C", 1.0))
+                st.session_state["probe_result"] = probe_result
+            except Exception as exc:
+                st.error(f"Probe failed: {type(exc).__name__}: {exc}")
+    else:
+        substring = st.text_input("Property substring", "France")
+        quick_prompts = st.text_area(
+            "Prompts (one per line)",
+            "The capital of France is\nThe capital of Germany is\nThe capital of Japan is\nThe largest city in France is\nThe largest city in Germany is\nThe largest city in Japan is",
+            height=150,
+        )
+        if st.button("Fit probe (quick)"):
+            try:
+                prompts = [p.strip() for p in quick_prompts.split("\n") if p.strip()]
+                labels = generate_quick_labels(prompts, substring)
+                if len(set(labels)) < 2:
+                    st.warning("Need at least one prompt with and one without the substring.")
+                else:
+                    with st.spinner(f"Fitting probe on {len(prompts)} prompts…"):
+                        probe_result = fit_probes(runtime, prompts, labels, C=st.session_state.get("probe_C", 1.0))
+                    st.session_state["probe_result"] = probe_result
+            except Exception as exc:
+                st.error(f"Probe failed: {type(exc).__name__}: {exc}")
+
+    C_options = list(np.unique(np.logspace(-2, 2, 41)))
+    C_slider = st.select_slider(
+        "Penalty strength C (higher = less regularization)",
+        options=[round(float(c), 4) for c in C_options],
+        value=1.0,
+        format_func=lambda c: f"{c:g}",
+    )
+    st.session_state["probe_C"] = float(C_slider)
+
+    probe = st.session_state.get("probe_result")
+    if probe is not None:
+        st.write(f"Training set: {probe.n_prompts} prompts ({probe.n_positive} pos, {probe.n_negative} neg)")
+        st.plotly_chart(
+            px.line(probe.per_layer_accuracy, x="layer", y="accuracy", markers=True,
+                    title="Probe accuracy per layer"),
+            width="stretch",
+        )
+
+        best_layer = int(probe.per_layer_accuracy.loc[probe.per_layer_accuracy["accuracy"].idxmax(), "layer"])
+        direction = probe.direction[best_layer]
+        top_idx = np.argsort(np.abs(direction))[::-1][:10]
+        dir_df = pd.DataFrame({
+            "index": top_idx,
+            "value": [direction[i] for i in top_idx],
+        })
+        st.subheader(f"Probe direction at layer {best_layer} (top-10 components)")
+        st.dataframe(dir_df, width="stretch", hide_index=True)
+
+        if st.button("Copy direction vector"):
+            st.clipboard.set_text(repr(direction))
+            st.success("Direction vector copied to clipboard.")
+
+with tabs[8]:
     st.subheader("Optional tool integrations")
     status = installed_tools()
     st.dataframe(
