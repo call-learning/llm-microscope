@@ -4,3 +4,8 @@ __pycache__/
 .streamlit/secrets.toml
 .cache/
 
+# CocoIndex Code (ccc)
+/.cocoindex_code/
+
+# OpenCode local tooling
+/.opencode/node_modules/
