@@ -19,37 +19,49 @@ The working views use Hugging Face directly, so the app remains useful even if a
 
 ## Quick start
 
-You need Python 3.11 or 3.12 and a CUDA-enabled PyTorch installation. The safest route is to retain the PyTorch installation that already works on your machine.
+You need Python 3.11 or 3.12 and a CUDA-enabled PyTorch installation. The setup keeps any PyTorch that already works on your machine and only installs a CUDA build from the PyTorch wheel index when none is found (default: CUDA 13.0, override with `UV_TORCH_INDEX_URL`).
 
-### Existing CUDA/PyTorch environment
+### With `uv` (recommended)
+
+The one-shot setup script installs `uv` if missing, detects an existing CUDA PyTorch, creates `.venv`, and syncs all project dependencies from `uv.lock`:
 
 ```bash
 unzip llm-microscope.zip
 cd llm-microscope
+./scripts/setup.sh          # or: make setup
+uv run streamlit run app.py # or: make run
+```
 
-python -m venv --system-site-packages .venv
+Install every optional research integration instead:
+
+```bash
+./scripts/setup.sh --all    # or: make setup-all
+```
+
+Equivalent low-level commands:
+
+```bash
+uv venv -p 3.12
+uv pip install --python .venv/bin/python torch --index-url https://download.pytorch.org/whl/cu130
+uv sync --extra captum --extra umap
+```
+
+### With `pip` (no uv)
+
+```bash
+python3 -m venv .venv
 source .venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cu130
 pip install -e '.[captum,umap]'
 streamlit run app.py
 ```
 
-### With `uv`
-
-If `uv` selects the wrong PyTorch build, use the existing-environment method above.
-
-```bash
-unzip llm-microscope.zip
-cd llm-microscope
-uv sync --extra captum --extra umap
-uv run streamlit run app.py
-```
-
 Open <http://localhost:8501>.
 
-Check the GPU first:
+Check the GPU and installed integrations:
 
 ```bash
-python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+uv run python scripts/check_environment.py   # or: make check
 ```
 
 ## Optional research integrations
@@ -57,14 +69,14 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 Install individually because these libraries evolve quickly and may constrain PyTorch or Transformers versions:
 
 ```bash
-pip install -e '.[nnsight]'
-pip install -e '.[transformer-lens]'
+uv sync --extra nnsight
+uv sync --extra transformer-lens
 ```
 
 Or install everything:
 
 ```bash
-pip install -e '.[all]'
+uv sync --all-extras
 ```
 
 The **Toolbox** page detects installed integrations and runs small smoke probes. The main analysis pages do not depend on NNsight or TransformerLens.
