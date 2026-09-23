@@ -18,6 +18,7 @@ class Runtime:
     layers: Any
     final_norm: Any
     lm_head: Any
+    attn_implementation: str
 
 
 def select_dtype(device: torch.device) -> torch.dtype:
@@ -56,7 +57,17 @@ def final_norm(model: Any):
     raise ValueError("Could not locate the final normalization layer.")
 
 
-def load_runtime(model_name: str, trust_remote_code: bool = False) -> Runtime:
+def load_runtime(
+    model_name: str,
+    trust_remote_code: bool = False,
+    attn_implementation: str = "eager",
+) -> Runtime:
+    """Load a causal LM and its tokenizer.
+
+    ``attn_implementation`` defaults to ``"eager"`` because the workbench
+    needs attention weights for its Attention view; the optimized kernels
+    (SDPA / flash) run faster but do not expose the attention matrices.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = select_dtype(device)
     tokenizer = AutoTokenizer.from_pretrained(
@@ -68,6 +79,7 @@ def load_runtime(model_name: str, trust_remote_code: bool = False) -> Runtime:
         dtype=dtype,
         trust_remote_code=trust_remote_code,
         low_cpu_mem_usage=True,
+        attn_implementation=attn_implementation,
     ).to(device)
     model.eval()
     return Runtime(
@@ -79,6 +91,7 @@ def load_runtime(model_name: str, trust_remote_code: bool = False) -> Runtime:
         layers=decoder_layers(model),
         final_norm=final_norm(model),
         lm_head=model.get_output_embeddings(),
+        attn_implementation=attn_implementation,
     )
 
 

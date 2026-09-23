@@ -28,18 +28,78 @@ from microscope.probing import (
     generate_concept_labels,
     generate_quick_labels,
 )
+from microscope.docs import APP_SUBTITLE, APP_TITLE, DEFAULT_PROMPT, SIDEBAR_MODEL_CAPTION, view
 from microscope.runtime import cuda_stats, layer_modules, load_runtime
 from microscope.toolbox import installed_tools, nnsight_status, transformer_lens_probe
 
 
 st.set_page_config(page_title="LLM Microscope", page_icon="🔬", layout="wide")
-st.title("🔬 LLM Microscope")
-st.caption("Local interpretability workbench — logit lens, attention, activations, attribution and causal patching")
+st.title(APP_TITLE)
+st.caption(APP_SUBTITLE)
 
 
 @st.cache_resource(show_spinner="Loading model…")
-def cached_runtime(model_name: str, trust_remote_code: bool):
-    return load_runtime(model_name, trust_remote_code=trust_remote_code)
+def cached_runtime(model_name: str, trust_remote_code: bool, attn_implementation: str):
+    return load_runtime(
+        model_name,
+        trust_remote_code=trust_remote_code,
+        attn_implementation=attn_implementation,
+    )
+
+
+def _example_button(label: str, set_map: dict, run: str | None) -> bool:
+    """Render a suggested-action button and return whether it was just clicked.
+
+    Pre-filling the page's widgets is done by assigning to the widget's
+    ``st.session_state[<key>]`` from *this button's own callback* — the
+    Streamlit-recommended way to change a widget value without raising the
+    "created with a default value but also set via Session State" warning
+    (assigning to ``session_state`` for a keyed widget from a *different*
+    widget's ``on_click`` is what triggers that warning). ``set_map`` holds the
+    widget keys to pre-fill; ``run`` is an optional one-shot trigger name the
+    page checks to fire the relevant analysis.
+    """
+
+    def _callback() -> None:
+        for key, value in set_map.items():
+            st.session_state[key] = value
+
+    clicked = st.button(label, key=f"ex_{label}", on_click=_callback)
+    if clicked and run:
+        st.session_state[f"trigger_{run}"] = True
+    return clicked
+
+
+def page_intro(
+    what: str,
+    why: str,
+    examples: list[dict] | None = None,
+    example_label: str = "Suggested actions",
+) -> None:
+    """Render a compact explainer for a page.
+
+    ``what`` / ``why`` are shown inside a collapsed "About this view"
+    expander so they do not crowd the page. ``examples`` is a list of
+    ``{"label": str, "set": dict[str, Any], "run": str | None}`` rendered as
+    buttons inside a popover: clicking one pre-fills the page's widgets (via an
+    ``on_click`` callback that writes session state) and, when ``run`` is
+    given, sets a trigger flag the page uses to fire the analysis.
+    """
+    with st.expander("About this view"):
+        st.markdown(f"**What:** {what}\n\n**Why it matters:** {why}")
+
+    if examples:
+        with st.popover(example_label, icon=":material/science:"):
+            for ex in examples:
+                _example_button(ex["label"], ex.get("set", {}), ex.get("run"))
+
+
+def show_intro(tab_name: str) -> None:
+    """Render the explainer for a tab using its docs entry from docs.py."""
+    doc = view(tab_name)
+    if not doc["what"] and not doc["examples"]:
+        return
+    page_intro(doc["what"], doc["why"], doc.get("examples") or None)
 
 
 with st.sidebar:
@@ -47,10 +107,17 @@ with st.sidebar:
     model_name = st.text_input("Hugging Face model", "Qwen/Qwen3-1.7B")
     trust_remote_code = st.checkbox("Trust remote model code", value=False)
     max_length = st.slider("Maximum prompt tokens", 16, 512, 128, 16)
-    st.caption("Changing the model reloads it. Start with 1.7B on a 12 GB GPU.")
+    attn_impl = st.radio(
+        "Attention kernel",
+        ["eager", "sdpa", "flash_attention_2"],
+        index=0,
+        horizontal=True,
+        help="eager exposes the attention weights needed by the Attention view. sdpa / flash_attention_2 are faster but do not return attention matrices.",
+    )
+    st.caption(SIDEBAR_MODEL_CAPTION)
 
 try:
-    runtime = cached_runtime(model_name, trust_remote_code)
+    runtime = cached_runtime(model_name, trust_remote_code, attn_impl)
 except Exception as exc:
     st.error(f"Model loading failed: {type(exc).__name__}: {exc}")
     st.stop()
@@ -59,12 +126,29 @@ with st.sidebar:
     st.success(f"Loaded {runtime.model_name}")
     st.write(f"Layers: {len(runtime.layers)}")
     st.write(f"dtype: {runtime.dtype}")
+    st.write(f"Attention: {runtime.attn_implementation}")
     for key, value in cuda_stats().items():
         st.write(f"{key}: {value}")
 
-prompt = st.text_area("Prompt", "The capital of France is", height=90)
+# Pre-seed the prompt value before the widget is created. Using setdefault
+# (instead of a literal default on the widget) keeps the field from being blank
+# on first load while avoiding Streamlit's "created with a default value but
+# also set via Session State" warning: once the user types or a suggested-action
+# button sets the value, setdefault is a no-op on later reruns.
+st.session_state.setdefault("prompt", DEFAULT_PROMPT)
+prompt = st.text_area(
+    "Prompt",
+    value=None,
+    height=90,
+    key="prompt",
+    help="Type a prompt, or pick one from the suggested actions in each tab's popover.",
+)
+# Guard against a zero-token input (empty prompt tokenizes to 0 tokens and
+# crashes the model's attention reshape).
+if not prompt or not prompt.strip():
+    prompt = DEFAULT_PROMPT
 with_attention = st.checkbox("Capture attention maps", value=True)
-run = st.button("Analyse", type="primary")
+run = st.button("Analyse", type="primary") or bool(st.session_state.pop("trigger_analyse", False))
 
 if run:
     with st.spinner("Running analysis…"):
@@ -99,6 +183,7 @@ tabs = st.tabs(
 )
 
 with tabs[0]:
+    show_intro("Tokens & prediction")
     if result is None:
         st.info("Run an analysis first.")
     else:
@@ -123,6 +208,7 @@ with tabs[1]:
     if result is None:
         st.info("Run an analysis first.")
     else:
+        show_intro("Logit lens")
         st.subheader("Prediction decoded after every layer")
         st.caption("This applies the model's final normalization and output head to each intermediate residual state.")
         lens = logit_lens(runtime, result)
@@ -135,10 +221,15 @@ with tabs[1]:
         )
 
 with tabs[2]:
+    show_intro("Attention")
     if result is None:
         st.info("Run an analysis first.")
     elif not result.attentions:
-        st.warning("No attention matrices were returned. Optimized attention implementations (for example SDPA) do not expose weights; re-run with the model's attention implementation set to eager.")
+        st.warning(
+            "No attention matrices were returned. The model is using an optimized attention "
+            "kernel (SDPA or FlashAttention), which does not expose attention weights. Switch the "
+            "sidebar **Attention kernel** back to **eager** and re-run the analysis."
+        )
     else:
         layer = st.slider("Attention layer", 0, len(result.attentions) - 1, 0)
         attention = result.attentions[layer][0]
@@ -154,6 +245,7 @@ with tabs[2]:
         st.plotly_chart(fig, width="stretch")
 
 with tabs[3]:
+    show_intro("Activations")
     if result is None:
         st.info("Run an analysis first.")
     else:
@@ -171,9 +263,10 @@ with tabs[3]:
             st.warning(str(exc))
 
 with tabs[4]:
+    show_intro("Compare A/B")
     st.subheader("Compare final-token representations")
     prompt_b = st.text_area("Prompt B", "The capital of Germany is", key="prompt_b")
-    if st.button("Compare prompts"):
+    if st.button("Compare prompts") or bool(st.session_state.pop("trigger_compare", False)):
         try:
             a = analyse(runtime, prompt, max_length=max_length, with_attention=False)
             b = analyse(runtime, prompt_b, max_length=max_length, with_attention=False)
@@ -187,6 +280,7 @@ with tabs[4]:
             st.error(f"Comparison failed: {type(exc).__name__}: {exc}")
 
 with tabs[5]:
+    show_intro("Patching")
     st.subheader("Causal patching & ablation")
     st.caption("Copies or ablates the final-token state at a layer. Residual patching works on all architectures; attention/MLP output patching requires the self_attn/mlp convention.")
 
@@ -198,7 +292,7 @@ with tabs[5]:
     target_options = ["Residual"]
     if modules_available:
         target_options += ["Attention output", "MLP output"]
-    target_label = st.selectbox("Patch target", target_options)
+    target_label = st.selectbox("Patch target", target_options, key="patch_target_kind")
     target_map = {
         "Residual": PatchTarget.RESIDUAL,
         "Attention output": PatchTarget.ATTN_OUTPUT,
@@ -222,15 +316,16 @@ with tabs[5]:
         head_idx = st.slider("Query head", 0, n_heads - 1, 0)
 
     # Mode: single-layer or score curve
-    mode = st.radio("Mode", ["Single layer", "Score curve (all layers)"], horizontal=True)
+    mode = st.radio("Mode", ["Single layer", "Score curve (all layers)"], horizontal=True, key="mode")
 
     if mode == "Single layer":
         patch_layer = st.slider("Layer to patch", 0, len(runtime.layers) - 1, len(runtime.layers) // 2)
 
         # Ablation mode
-        ablation_mode = st.radio("Ablation", ["Off (patch)", "Zero", "Mean"], horizontal=True)
+        ablation_mode = st.radio("Ablation", ["Off (patch)", "Zero", "Mean"], horizontal=True, key="ablation")
 
-        if st.button("Run patching experiment"):
+        run_patch = st.button("Run patching experiment") or bool(st.session_state.pop("trigger_patch_single", False))
+        if run_patch:
             try:
                 if ablation_mode == "Off (patch)":
                     if target is PatchTarget.RESIDUAL:
@@ -272,7 +367,8 @@ with tabs[5]:
 
     else:  # Score curve
         curve_metric = st.radio("Curve metric", ["Logit delta", "Probability delta"], horizontal=True)
-        if st.button("Run score curve"):
+        run_curve = st.button("Run score curve") or bool(st.session_state.pop("trigger_patch_curve", False))
+        if run_curve:
             with st.spinner("Running patching score curve (1 source + 1 baseline + N patched forwards)…"):
                 try:
                     curve = patching_score_curve(
@@ -298,10 +394,12 @@ with tabs[5]:
             st.dataframe(curve, width="stretch", hide_index=True)
 
 with tabs[6]:
+    show_intro("Attribution")
     st.subheader("Gradient × input attribution")
     st.caption("Scores input-token contribution to the final position's selected output logit.")
-    target_id_text = st.text_input("Target token ID (blank = model's top prediction)", "")
-    if st.button("Calculate attribution"):
+    target_id_text = st.text_input("Target token ID (blank = model's top prediction)", "", key="attr_target")
+    run_attr = st.button("Calculate attribution") or bool(st.session_state.pop("trigger_attribution", False))
+    if run_attr:
         try:
             target_id = int(target_id_text) if target_id_text.strip() else None
             attribution, chosen_id = gradient_x_input(
@@ -321,19 +419,21 @@ with tabs[6]:
             st.error(f"Attribution failed: {type(exc).__name__}: {exc}")
 
 with tabs[7]:
+    show_intro("Linear Probe")
     st.subheader("Linear Probe")
     st.caption("Fits a binary L2 logistic regression on the final-token hidden state at each layer. Shows where a property becomes linearly decodable.")
 
-    probe_mode = st.radio("Label mode", ["Concept (contrastive)", "Quick (substring)"], horizontal=True)
+    probe_mode = st.radio("Label mode", ["Concept (contrastive)", "Quick (substring)"], horizontal=True, key="probe_mode")
 
     prompts: list[str] = []
     labels: list[int] = []
 
     if probe_mode == "Concept (contrastive)":
-        pos_template = st.text_input("Positive template", "The capital of {X} is")
-        neg_template = st.text_input("Negative template", "The largest city in {X} is")
-        fill_values = st.text_input("Fill values (comma-separated)", "France, Germany, Japan, Spain, Italy, Brazil")
-        if st.button("Fit probe (concept)"):
+        pos_template = st.text_input("Positive template", "The capital of {X} is", key="pos_template")
+        neg_template = st.text_input("Negative template", "The largest city in {X} is", key="neg_template")
+        fill_values = st.text_input("Fill values (comma-separated)", "France, Germany, Japan, Spain, Italy, Brazil", key="fill_values")
+        run_probe_concept = st.button("Fit probe (concept)") or bool(st.session_state.pop("trigger_probe_concept", False))
+        if run_probe_concept:
             try:
                 prompts, labels = generate_concept_labels(pos_template, neg_template, fill_values)
                 with st.spinner(f"Fitting probe on {len(prompts)} prompts…"):
@@ -342,13 +442,15 @@ with tabs[7]:
             except Exception as exc:
                 st.error(f"Probe failed: {type(exc).__name__}: {exc}")
     else:
-        substring = st.text_input("Property substring", "France")
+        substring = st.text_input("Property substring", "France", key="substring")
         quick_prompts = st.text_area(
             "Prompts (one per line)",
             "The capital of France is\nThe capital of Germany is\nThe capital of Japan is\nThe largest city in France is\nThe largest city in Germany is\nThe largest city in Japan is",
             height=150,
+            key="quick_prompts",
         )
-        if st.button("Fit probe (quick)"):
+        run_probe_quick = st.button("Fit probe (quick)") or bool(st.session_state.pop("trigger_probe_quick", False))
+        if run_probe_quick:
             try:
                 prompts = [p.strip() for p in quick_prompts.split("\n") if p.strip()]
                 labels = generate_quick_labels(prompts, substring)
@@ -394,6 +496,7 @@ with tabs[7]:
             st.success("Direction vector copied to clipboard.")
 
 with tabs[8]:
+    show_intro("Toolbox")
     st.subheader("Optional tool integrations")
     status = installed_tools()
     st.dataframe(

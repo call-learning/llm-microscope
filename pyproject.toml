@@ -13,6 +13,11 @@ dependencies = [
   "scikit-learn>=1.5",
   "streamlit>=1.41",
   "transformers>=4.51,<6",
+  # Needed so transformers' vision processors import cleanly (Streamlit's
+  # source watcher introspects every module, including vitmatte/vitpose,
+  # which `import torchvision` at module load). Resolved from the PyTorch
+  # wheel index to match the installed CUDA torch build.
+  "torchvision>=0.20",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +37,7 @@ package = false
 
 [tool.uv.sources]
 torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
 
 [[tool.uv.index]]
 name = "pytorch"
