@@ -253,6 +253,28 @@ def patching_score_curve(
     return pd.DataFrame(rows)
 
 
+def patching_effect_matrix(
+    runs: list[dict[str, object]],
+    metric: str,
+) -> pd.DataFrame:
+    """Assemble compatible patch-curve runs into a layer-by-target matrix."""
+    if not runs:
+        raise ValueError("At least one patching run is required.")
+    rows = []
+    for run in runs:
+        curve = run["curve"]
+        if not isinstance(curve, pd.DataFrame) or metric not in curve:
+            raise ValueError(f"Patching run does not contain metric {metric!r}.")
+        values = curve.set_index("layer")[metric]
+        rows.append(
+            {
+                "patch target": run["patch_target_display"],
+                **{int(layer): value for layer, value in values.items()},
+            }
+        )
+    return pd.DataFrame(rows).set_index("patch target")
+
+
 def patch_final_residual(
     runtime: Runtime,
     source_prompt: str,
@@ -402,8 +424,8 @@ def gradient_x_input(
         target_token_id = int(outputs.logits[0, -1].argmax())
     score = outputs.logits[0, -1, target_token_id]
     score.backward()
-    importance = (embeddings.grad * embeddings).sum(dim=-1).abs()[0]
-    importance = importance / importance.max().clamp_min(1e-12)
+    importance = (embeddings.grad * embeddings).sum(dim=-1)[0]
+    importance = importance / importance.abs().max().clamp_min(1e-12)
     tokens = [
         runtime.tokenizer.decode([int(token_id)], clean_up_tokenization_spaces=False)
         for token_id in batch["input_ids"][0]
@@ -413,7 +435,70 @@ def gradient_x_input(
             "position": range(len(tokens)),
             "token": [repr(token) for token in tokens],
             "importance": importance.detach().float().cpu().numpy(),
+            "magnitude": importance.detach().float().cpu().abs().numpy(),
+            "method": "Gradient x Input",
         }
     )
     return df, target_token_id
 
+
+def integrated_gradients(
+    runtime: Runtime,
+    prompt: str,
+    target_token_id: int | None = None,
+    max_length: int = 256,
+    n_steps: int = 16,
+) -> tuple[pd.DataFrame, int]:
+    """Compute optional Captum Integrated Gradients for one output token."""
+    try:
+        from captum.attr import IntegratedGradients
+    except ImportError as exc:
+        raise RuntimeError(
+            "Integrated Gradients requires the optional 'captum' extra."
+        ) from exc
+    if n_steps < 2:
+        raise ValueError("Integrated Gradients requires at least 2 steps.")
+
+    batch = tokenize(runtime, prompt, max_length=max_length)
+    embeddings = runtime.model.get_input_embeddings()(batch["input_ids"]).detach()
+    with torch.inference_mode():
+        baseline = torch.zeros_like(embeddings)
+        initial_outputs = runtime.model(
+            inputs_embeds=embeddings,
+            attention_mask=batch.get("attention_mask"),
+            use_cache=False,
+        )
+    if target_token_id is None:
+        target_token_id = int(initial_outputs.logits[0, -1].argmax())
+
+    def forward(inputs_embeds: torch.Tensor, attention_mask: torch.Tensor):
+        outputs = runtime.model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        return outputs.logits[:, -1, target_token_id]
+
+    runtime.model.zero_grad(set_to_none=True)
+    attributions = IntegratedGradients(forward).attribute(
+        embeddings,
+        baselines=baseline,
+        additional_forward_args=(batch.get("attention_mask"),),
+        n_steps=n_steps,
+    )
+    signed = attributions.sum(dim=-1)[0]
+    signed = signed / signed.abs().max().clamp_min(1e-12)
+    tokens = [
+        runtime.tokenizer.decode([int(token_id)], clean_up_tokenization_spaces=False)
+        for token_id in batch["input_ids"][0]
+    ]
+    df = pd.DataFrame(
+        {
+            "position": range(len(tokens)),
+            "token": [repr(token) for token in tokens],
+            "importance": signed.detach().float().cpu().numpy(),
+            "magnitude": signed.detach().float().cpu().abs().numpy(),
+            "method": "Integrated Gradients",
+        }
+    )
+    return df, target_token_id

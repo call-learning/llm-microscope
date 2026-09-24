@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 import torch
@@ -9,9 +10,15 @@ import torch
 from microscope.analysis import (
     analyse,
     cosine_by_layer,
+    attention_head_similarity,
+    attention_head_summary,
+    attention_rollout,
     final_token_evolution,
     layer_norms,
+    layer_prediction_metrics,
     logit_lens,
+    pairwise_cosine_distances,
+    representation_metrics,
     reduce_activations,
     top_tokens,
 )
@@ -20,7 +27,9 @@ from microscope.interventions import (
     gradient_x_input,
     mean_ablation,
     patch_final_residual,
+    patching_effect_matrix,
     patching_score_curve,
+    integrated_gradients,
 )
 from microscope.probing import (
     ProbeResult,
@@ -28,14 +37,23 @@ from microscope.probing import (
     generate_concept_labels,
     generate_quick_labels,
 )
-from microscope.docs import APP_SUBTITLE, APP_TITLE, DEFAULT_PROMPT, SIDEBAR_MODEL_CAPTION, view
+from microscope.docs import (
+    APP_GUIDE,
+    APP_SUBTITLE,
+    APP_TITLE,
+    DEFAULT_PROMPT,
+    SIDEBAR_MODEL_CAPTION,
+    view,
+)
 from microscope.runtime import cuda_stats, layer_modules, load_runtime
-from microscope.toolbox import installed_tools, nnsight_status, transformer_lens_probe
+from microscope.toolbox import probe_tool, tool_status_rows
 
 
 st.set_page_config(page_title="LLM Microscope", page_icon="🔬", layout="wide")
 st.title(APP_TITLE)
 st.caption(APP_SUBTITLE)
+with st.expander("How to use this workbench", expanded=True):
+    st.markdown(APP_GUIDE)
 
 
 @st.cache_resource(show_spinner="Loading model…")
@@ -73,6 +91,7 @@ def _example_button(label: str, set_map: dict, run: str | None) -> bool:
 def page_intro(
     what: str,
     why: str,
+    know: str = "",
     examples: list[dict] | None = None,
     example_label: str = "Suggested actions",
 ) -> None:
@@ -86,7 +105,9 @@ def page_intro(
     given, sets a trigger flag the page uses to fire the analysis.
     """
     with st.expander("About this view"):
-        st.markdown(f"**What:** {what}\n\n**Why it matters:** {why}")
+        st.markdown(f"**What it is:** {what}\n\n**What it helps you understand:** {why}")
+        if know:
+            st.markdown(f"**Prior knowledge:** {know}")
 
     if examples:
         with st.popover(example_label, icon=":material/science:"):
@@ -99,7 +120,12 @@ def show_intro(tab_name: str) -> None:
     doc = view(tab_name)
     if not doc["what"] and not doc["examples"]:
         return
-    page_intro(doc["what"], doc["why"], doc.get("examples") or None)
+    page_intro(doc["what"], doc["why"], doc.get("know", ""), doc.get("examples") or None)
+
+
+def analysis_identity(model_name: str, prompt: str, max_length: int) -> tuple[str, str, int]:
+    """Identify derived visual data belonging to the current analysis inputs."""
+    return model_name, prompt, max_length
 
 
 with st.sidebar:
@@ -112,7 +138,7 @@ with st.sidebar:
         ["eager", "sdpa", "flash_attention_2"],
         index=0,
         horizontal=True,
-        help="eager exposes the attention weights needed by the Attention view. sdpa / flash_attention_2 are faster but do not return attention matrices.",
+        help="How the attention math is executed. 'eager' is the reference implementation and returns the attention weights, so the Attention tab needs it. 'sdpa' and 'flash_attention_2' are faster but only return the final hidden states, not the per-head attention matrices. Leave it on 'eager' unless you are only using the other views.",
     )
     st.caption(SIDEBAR_MODEL_CAPTION)
 
@@ -141,13 +167,17 @@ prompt = st.text_area(
     value=None,
     height=90,
     key="prompt",
-    help="Type a prompt, or pick one from the suggested actions in each tab's popover.",
+    help="The text sent to the model. Decoder-only language models read the prompt from left to right and predict what token should come next. You can use a sentence, a question, or code. The model's tokenizer may split familiar words into several tokens; inspect Tokens & prediction to see the actual input.",
 )
 # Guard against a zero-token input (empty prompt tokenizes to 0 tokens and
 # crashes the model's attention reshape).
 if not prompt or not prompt.strip():
     prompt = DEFAULT_PROMPT
-with_attention = st.checkbox("Capture attention maps", value=True)
+with_attention = st.checkbox(
+    "Capture attention maps",
+    value=True,
+    help="When enabled, the model returns the per-layer, per-head attention weights used by the Attention tab. This uses extra memory, and optimized attention kernels may not expose these weights. Turn it off for faster or lower-memory runs when you do not need that tab.",
+)
 run = st.button("Analyse", type="primary") or bool(st.session_state.pop("trigger_analyse", False))
 
 if run:
@@ -160,6 +190,10 @@ if run:
                 with_attention=with_attention,
             )
             st.session_state["analysis_prompt"] = prompt
+            st.session_state["analysis_identity"] = analysis_identity(
+                runtime.model_name, prompt, max_length,
+            )
+            st.session_state.pop("prediction_metrics_cache", None)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             st.error("CUDA ran out of memory. Shorten the prompt, disable attention maps, or use a smaller model.")
@@ -167,10 +201,14 @@ if run:
             st.error(f"Analysis failed: {type(exc).__name__}: {exc}")
 
 result = st.session_state.get("analysis")
+current_analysis = st.session_state.get("analysis_identity") == analysis_identity(
+    runtime.model_name, prompt, max_length,
+)
 
 tabs = st.tabs(
     [
         "Tokens & prediction",
+        "Prediction journey",
         "Logit lens",
         "Attention",
         "Activations",
@@ -205,6 +243,98 @@ with tabs[0]:
         )
 
 with tabs[1]:
+    show_intro("Prediction journey")
+    if result is None or not current_analysis:
+        st.info("Run an analysis for the current prompt first.")
+    else:
+        candidate_df = top_tokens(runtime, result.logits[0, -1], k=20)
+        candidate_ids = candidate_df["token_id"].tolist()
+        selected_id = st.selectbox(
+            "Candidate token to follow",
+            candidate_ids,
+            format_func=lambda token_id: (
+                f"{runtime.tokenizer.decode([int(token_id)], clean_up_tokenization_spaces=False)!r} "
+                f"(ID {token_id})"
+            ),
+            key="journey_token_id",
+        )
+        journey_metric = st.radio(
+            "Journey metric",
+            ["Probability", "Rank", "Logit", "Entropy"],
+            horizontal=True,
+            key="journey_metric",
+        )
+        metric_column = journey_metric.lower()
+        try:
+            cache_key = (current_analysis, int(selected_id))
+            cache = st.session_state.setdefault("prediction_metrics_cache", {})
+            if cache_key not in cache:
+                with st.spinner("Decoding the selected token through all layers…"):
+                    cache[cache_key] = layer_prediction_metrics(runtime, result, int(selected_id))
+            journey = cache[cache_key]
+            position = st.slider(
+                "Prompt position for the layer chart",
+                0,
+                len(result.labels) - 1,
+                len(result.labels) - 1,
+                format="%d",
+            )
+            heatmap = journey.pivot(index="layer", columns="position", values=metric_column)
+            st.plotly_chart(
+                px.imshow(
+                    heatmap,
+                    aspect="auto",
+                    labels={"x": "Prompt token position", "y": "Layer", "color": journey_metric},
+                    x=[f"{index}: {label.split(': ', 1)[-1]}" for index, label in enumerate(result.labels)],
+                    title=f"{journey_metric} for {runtime.tokenizer.decode([int(selected_id)], clean_up_tokenization_spaces=False)!r}",
+                ),
+                width="stretch",
+            )
+            position_curve = journey[journey["position"] == position]
+            st.plotly_chart(
+                px.line(
+                    position_curve,
+                    x="layer",
+                    y=metric_column,
+                    markers=True,
+                    title=f"{journey_metric} at position {position}: {result.labels[position]}",
+                ),
+                width="stretch",
+            )
+            st.caption(
+                "Entropy measures how concentrated the full next-token distribution is at a position. "
+                "Higher entropy means less concentration, not necessarily an incorrect prediction."
+            )
+            left, right = st.columns(2)
+            left.subheader("Final-position candidates")
+            left.plotly_chart(
+                px.bar(
+                    candidate_df.sort_values("probability"),
+                    x="probability",
+                    y="token",
+                    orientation="h",
+                    hover_data=["token_id", "rank"],
+                    labels={"probability": "Probability", "token": "Candidate token"},
+                ),
+                width="stretch",
+            )
+            right.subheader("Final-layer entropy by position")
+            final_entropy = journey[journey["layer"] == journey["layer"].max()]
+            right.plotly_chart(
+                px.line(
+                    final_entropy,
+                    x="position",
+                    y="entropy",
+                    markers=True,
+                    hover_data=["token"],
+                    labels={"entropy": "Entropy", "position": "Prompt token position"},
+                ),
+                width="stretch",
+            )
+        except Exception as exc:
+            st.warning(f"Prediction journey unavailable: {type(exc).__name__}: {exc}")
+
+with tabs[2]:
     if result is None:
         st.info("Run an analysis first.")
     else:
@@ -220,7 +350,7 @@ with tabs[1]:
             width="stretch",
         )
 
-with tabs[2]:
+with tabs[3]:
     show_intro("Attention")
     if result is None:
         st.info("Run an analysis first.")
@@ -234,23 +364,137 @@ with tabs[2]:
         layer = st.slider("Attention layer", 0, len(result.attentions) - 1, 0)
         attention = result.attentions[layer][0]
         head = st.slider("Attention head", 0, attention.shape[0] - 1, 0)
+        token_axes = [f"{position}: {label.split(': ', 1)[-1]}" for position, label in enumerate(result.labels)]
         fig = px.imshow(
             attention[head].numpy(),
-            x=result.labels,
-            y=result.labels,
+            x=token_axes,
+            y=token_axes,
             labels={"x": "Key token", "y": "Query token", "color": "Attention"},
             aspect="auto",
             title=f"Layer {layer}, head {head}",
         )
         st.plotly_chart(fig, width="stretch")
 
-with tabs[3]:
+        summary = attention_head_summary(result.attentions, result.labels)
+        selected_summary = summary[
+            (summary["layer"] == layer) & (summary["head"] == head)
+        ]
+        st.subheader("Selected-head summary")
+        st.dataframe(
+            selected_summary[
+                ["query_position", "query_token", "entropy", "max_key_position", "max_key_token", "max_attention"]
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption(
+            "Attention entropy measures how concentrated a query row is over key positions. "
+            "It is not a measure of causal importance."
+        )
+
+        compare_heads = st.multiselect(
+            "Heads to compare",
+            list(range(attention.shape[0])),
+            default=[head],
+            format_func=lambda value: f"Head {value}",
+            key="attention_compare_heads",
+        )
+        if compare_heads:
+            comparison = summary[
+                (summary["layer"] == layer) & summary["head"].isin(compare_heads)
+            ]
+            st.plotly_chart(
+                px.line(
+                    comparison,
+                    x="query_position",
+                    y="entropy",
+                    color="head",
+                    markers=True,
+                    hover_data=["query_token", "max_key_position", "max_key_token"],
+                    labels={"query_position": "Query position", "entropy": "Attention entropy"},
+                    title=f"Head comparison at layer {layer}",
+                ),
+                width="stretch",
+            )
+        if st.checkbox("Show raw-pattern head similarity", key="attention_similarity"):
+            similarity = attention_head_similarity(result.attentions, layer)
+            st.plotly_chart(
+                px.imshow(
+                    similarity,
+                    aspect="auto",
+                    labels={"x": "Head", "y": "Head", "color": "Cosine similarity"},
+                    title=f"Raw attention-pattern similarity at layer {layer}",
+                ),
+                width="stretch",
+            )
+
+        if st.checkbox("Show attention rollout", key="attention_rollout"):
+            try:
+                rollout = attention_rollout(result.attentions, include_residual=True)
+                st.plotly_chart(
+                    px.imshow(
+                        rollout.numpy(),
+                        x=token_axes,
+                        y=token_axes,
+                        labels={"x": "Key token", "y": "Query token", "color": "Rollout weight"},
+                        aspect="auto",
+                        title="Attention rollout across layers and heads",
+                    ),
+                    width="stretch",
+                )
+                st.caption(
+                    "Rollout averages heads, adds an identity residual connection, row-normalizes each "
+                    "layer, and composes layers from early to late. It is descriptive, not automatically causal."
+                )
+            except Exception as exc:
+                st.warning(f"Attention rollout unavailable: {type(exc).__name__}: {exc}")
+
+with tabs[4]:
     show_intro("Activations")
     if result is None:
         st.info("Run an analysis first.")
     else:
         norms = layer_norms(result)
         st.plotly_chart(px.line(norms, x="layer", y="norm", markers=True), width="stretch")
+        activation_metric_label = st.radio(
+            "Activation heatmap metric",
+            ["Hidden-state norm", "Layer-to-layer cosine change"],
+            horizontal=True,
+            key="activation_metric",
+        )
+        activation_metric = "norm" if activation_metric_label == "Hidden-state norm" else "cosine_change"
+        activation_data = representation_metrics(result, activation_metric)
+        activation_heatmap = activation_data.pivot(index="layer", columns="position", values="value")
+        st.plotly_chart(
+            px.imshow(
+                activation_heatmap,
+                aspect="auto",
+                labels={"x": "Prompt token position", "y": "Layer", "color": activation_metric_label},
+                x=[f"{index}: {label.split(': ', 1)[-1]}" for index, label in enumerate(result.labels)],
+                title=activation_metric_label,
+            ),
+            width="stretch",
+        )
+        token_position = st.slider(
+            "Token position for representation trajectory",
+            0,
+            len(result.labels) - 1,
+            len(result.labels) - 1,
+            key="activation_token_position",
+        )
+        trajectory = activation_data[activation_data["position"] == token_position]
+        st.plotly_chart(
+            px.line(
+                trajectory,
+                x="layer",
+                y="value",
+                markers=True,
+                hover_data=["token", "position"],
+                labels={"value": activation_metric_label},
+                title=f"{activation_metric_label} trajectory for {result.labels[token_position]}",
+            ),
+            width="stretch",
+        )
         layer = st.slider("Projection layer", 0, len(result.hidden_states) - 2, len(result.hidden_states) // 2)
         method = st.radio("Projection", ["PCA", "UMAP"], horizontal=True)
         try:
@@ -261,8 +505,22 @@ with tabs[3]:
             )
         except Exception as exc:
             st.warning(str(exc))
+        if st.checkbox("Show pairwise cosine-distance matrix", key="activation_pairwise"):
+            try:
+                distances = pairwise_cosine_distances(result, layer)
+                st.plotly_chart(
+                    px.imshow(
+                        distances,
+                        aspect="auto",
+                        labels={"x": "Token", "y": "Token", "color": "Cosine distance"},
+                        title=f"Pairwise cosine distance at layer {layer}",
+                    ),
+                    width="stretch",
+                )
+            except Exception as exc:
+                st.warning(f"Pairwise comparison unavailable: {type(exc).__name__}: {exc}")
 
-with tabs[4]:
+with tabs[5]:
     show_intro("Compare A/B")
     st.subheader("Compare final-token representations")
     prompt_b = st.text_area("Prompt B", "The capital of Germany is", key="prompt_b")
@@ -279,7 +537,7 @@ with tabs[4]:
         except Exception as exc:
             st.error(f"Comparison failed: {type(exc).__name__}: {exc}")
 
-with tabs[5]:
+with tabs[6]:
     show_intro("Patching")
     st.subheader("Causal patching & ablation")
     st.caption("Copies or ablates the final-token state at a layer. Residual patching works on all architectures; attention/MLP output patching requires the self_attn/mlp convention.")
@@ -376,6 +634,32 @@ with tabs[5]:
                         max_length=max_length, head_idx=head_idx,
                     )
                     st.session_state["patch_curve"] = curve
+                    patch_target_key = target.value
+                    patch_target_display = target_label
+                    if target is PatchTarget.ATTN_OUTPUT:
+                        patch_target_display = f"{target_label} (head {head_idx})"
+                    patch_runs = st.session_state.setdefault("patch_curve_runs", {})
+                    run_key = (
+                        runtime.model_name,
+                        source,
+                        target_prompt,
+                        max_length,
+                        patch_target_key,
+                        head_idx,
+                    )
+                    patch_runs[run_key] = {
+                        "curve": curve,
+                        "model": runtime.model_name,
+                        "source": source,
+                        "target": target_prompt,
+                        "max_length": max_length,
+                        "patch_target": patch_target_key,
+                        "patch_target_display": patch_target_display,
+                        "head_idx": head_idx,
+                        "metrics": ["delta_logit", "delta_prob"],
+                        "display_metric": curve_metric,
+                    }
+                    st.session_state["patch_curve_meta"] = patch_runs[run_key]
                 except torch.cuda.OutOfMemoryError:
                     torch.cuda.empty_cache()
                     st.error("CUDA ran out of memory. Shorten the prompt or use a smaller model.")
@@ -385,6 +669,12 @@ with tabs[5]:
         curve = st.session_state.get("patch_curve")
         if curve is not None:
             y_col = "delta_logit" if curve_metric == "Logit delta" else "delta_prob"
+            metadata = st.session_state.get("patch_curve_meta", {})
+            st.caption(
+                f"Source: {metadata.get('source', source)!r} | "
+                f"Target: {metadata.get('target', target_prompt)!r} | "
+                f"Baseline: unmodified target | Metric: {curve_metric}"
+            )
             st.plotly_chart(
                 px.line(curve, x="layer", y=y_col, markers=True,
                         title=f"Patching score curve ({target_label})"),
@@ -392,33 +682,111 @@ with tabs[5]:
             )
             st.subheader("Per-layer detail")
             st.dataframe(curve, width="stretch", hide_index=True)
+            st.caption(
+                "A changed output is evidence that the intervention influenced this prediction; "
+                "it is not automatically a human-readable concept attribution."
+            )
 
-with tabs[6]:
+            compatible_runs = [
+                run
+                for run in st.session_state.get("patch_curve_runs", {}).values()
+                if run["model"] == runtime.model_name
+                and run["source"] == source
+                and run["target"] == target_prompt
+                and run["max_length"] == max_length
+                and y_col in run.get("metrics", [])
+            ]
+            if compatible_runs:
+                matrix = patching_effect_matrix(compatible_runs, y_col)
+                st.subheader("Patch-target comparison")
+                st.caption(
+                    "This matrix compares only completed, compatible runs. Missing targets are not zero effects."
+                )
+                st.plotly_chart(
+                    px.imshow(
+                        matrix,
+                        aspect="auto",
+                        labels={"x": "Patch layer", "y": "Patch target", "color": curve_metric},
+                        title=f"Patching effect matrix ({curve_metric})",
+                    ),
+                    width="stretch",
+                )
+
+with tabs[7]:
     show_intro("Attribution")
-    st.subheader("Gradient × input attribution")
-    st.caption("Scores input-token contribution to the final position's selected output logit.")
+    st.subheader("Token attribution comparison")
+    st.caption("Scores input-token contribution to the final position's selected output logit. Scores are signed and local to the selected output token.")
     target_id_text = st.text_input("Target token ID (blank = model's top prediction)", "", key="attr_target")
+    attribution_methods = st.multiselect(
+        "Attribution methods",
+        ["Gradient x Input", "Integrated Gradients"],
+        default=["Gradient x Input"],
+        key="attribution_methods",
+    )
+    ig_steps = 16
+    if "Integrated Gradients" in attribution_methods:
+        ig_steps = st.slider("Integrated Gradients steps", 2, 64, 16, 2)
     run_attr = st.button("Calculate attribution") or bool(st.session_state.pop("trigger_attribution", False))
     if run_attr:
         try:
+            if not attribution_methods:
+                raise ValueError("Select at least one attribution method.")
             target_id = int(target_id_text) if target_id_text.strip() else None
-            attribution, chosen_id = gradient_x_input(
-                runtime,
-                prompt,
-                target_token_id=target_id,
-                max_length=max_length,
-            )
-            chosen = runtime.tokenizer.decode([chosen_id], clean_up_tokenization_spaces=False)
-            st.write(f"Target token: `{chosen!r}` (ID {chosen_id})")
-            st.plotly_chart(
-                px.bar(attribution, x="token", y="importance", hover_data=["position"]),
-                width="stretch",
-            )
-            st.dataframe(attribution, width="stretch", hide_index=True)
+            results = {}
+            method_errors = {}
+            chosen_id = target_id
+            with st.spinner("Calculating attribution…"):
+                for method in attribution_methods:
+                    try:
+                        if method == "Gradient x Input":
+                            attribution, chosen_id = gradient_x_input(
+                                runtime, prompt, target_token_id=target_id, max_length=max_length,
+                            )
+                        else:
+                            attribution, chosen_id = integrated_gradients(
+                                runtime, prompt, target_token_id=target_id,
+                                max_length=max_length, n_steps=ig_steps,
+                            )
+                        results[method] = attribution
+                    except Exception as exc:
+                        method_errors[method] = f"{type(exc).__name__}: {exc}"
+            st.session_state["attribution_results"] = results
+            st.session_state["attribution_target_id"] = chosen_id
+            st.session_state["attribution_errors"] = method_errors
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            st.error("CUDA ran out of memory. Reduce the prompt length or Integrated Gradients steps.")
         except Exception as exc:
             st.error(f"Attribution failed: {type(exc).__name__}: {exc}")
 
-with tabs[7]:
+    attribution_results = st.session_state.get("attribution_results", {})
+    chosen_id = st.session_state.get("attribution_target_id")
+    for method, message in st.session_state.get("attribution_errors", {}).items():
+        st.warning(f"{method} unavailable: {message}")
+    if attribution_results and chosen_id is not None:
+        chosen = runtime.tokenizer.decode([chosen_id], clean_up_tokenization_spaces=False)
+        st.write(f"Target token: `{chosen!r}` (ID {chosen_id})")
+        for method, attribution in attribution_results.items():
+            st.subheader(method)
+            st.plotly_chart(
+                px.bar(
+                    attribution,
+                    x="token",
+                    y="importance",
+                    color="importance",
+                    color_continuous_scale="RdBu",
+                    hover_data=["position", "magnitude"],
+                    labels={"importance": "Signed attribution"},
+                ),
+                width="stretch",
+            )
+            st.dataframe(attribution, width="stretch", hide_index=True)
+        st.caption(
+            "Positive values support the selected output token and negative values oppose it. "
+            "Attribution is method-dependent and local; agreement between methods is not proof of a complete causal explanation."
+        )
+
+with tabs[8]:
     show_intro("Linear Probe")
     st.subheader("Linear Probe")
     st.caption("Fits a binary L2 logistic regression on the final-token hidden state at each layer. Shows where a property becomes linearly decodable.")
@@ -474,12 +842,47 @@ with tabs[7]:
 
     probe = st.session_state.get("probe_result")
     if probe is not None:
-        st.write(f"Training set: {probe.n_prompts} prompts ({probe.n_positive} pos, {probe.n_negative} neg)")
-        st.plotly_chart(
-            px.line(probe.per_layer_accuracy, x="layer", y="accuracy", markers=True,
-                    title="Probe accuracy per layer"),
-            width="stretch",
+        st.write(
+            f"Training set: {probe.n_prompts} prompts "
+            f"({probe.n_positive} positive, {probe.n_negative} negative)"
         )
+        if max(probe.n_positive, probe.n_negative) / max(probe.n_prompts, 1) > 0.6:
+            st.warning(
+                "The probe labels are imbalanced. Accuracy may be dominated by the majority class."
+            )
+        st.caption(
+            "Probe accuracy indicates decodability, not that the model uses the feature for its answer. "
+            "Prompt templates can also provide shortcuts."
+        )
+        if not probe.heldout_supported:
+            st.warning(
+                "This dataset is too small for a meaningful stratified held-out split. "
+                "The accuracy curve is training-only."
+            )
+        figure = go.Figure()
+        figure.add_trace(go.Scatter(
+            x=probe.per_layer_accuracy["layer"],
+            y=probe.per_layer_accuracy["train_accuracy"],
+            mode="lines+markers",
+            name="Training accuracy",
+        ))
+        if probe.heldout_supported:
+            figure.add_trace(go.Scatter(
+                x=probe.per_layer_accuracy["layer"],
+                y=probe.per_layer_accuracy["heldout_accuracy"],
+                error_y={"type": "data", "array": probe.per_layer_accuracy["heldout_std"].fillna(0)},
+                mode="lines+markers",
+                name="Held-out accuracy",
+            ))
+        figure.add_trace(go.Scatter(
+            x=probe.per_layer_accuracy["layer"],
+            y=probe.per_layer_accuracy["baseline_accuracy"],
+            mode="lines",
+            name="Majority baseline",
+            line={"dash": "dash"},
+        ))
+        figure.update_layout(title="Probe accuracy per layer", xaxis_title="Layer", yaxis_title="Accuracy")
+        st.plotly_chart(figure, width="stretch")
 
         best_layer = int(probe.per_layer_accuracy.loc[probe.per_layer_accuracy["accuracy"].idxmax(), "layer"])
         direction = probe.direction[best_layer]
@@ -495,17 +898,27 @@ with tabs[7]:
             st.clipboard.set_text(repr(direction))
             st.success("Direction vector copied to clipboard.")
 
-with tabs[8]:
+with tabs[9]:
     show_intro("Toolbox")
     st.subheader("Optional tool integrations")
-    status = installed_tools()
+    tool_compatibility = st.session_state.get("tool_compatibility", {})
     st.dataframe(
-        pd.DataFrame([{"tool": tool, "installed": installed} for tool, installed in status.items()]),
+        pd.DataFrame(tool_status_rows(tool_compatibility)),
         width="stretch",
         hide_index=True,
     )
-    st.write(nnsight_status())
-    st.caption("TransformerLens uses its own model wrapper and can require additional VRAM. The probe deliberately loads on CPU.")
-    if st.button("Probe TransformerLens compatibility"):
-        st.write(transformer_lens_probe(model_name))
-
+    st.caption(
+        "Optional tools add tracing, interventions, attribution, sparse features, or visualization. "
+        "They are isolated from the core Hugging Face analysis and are never executed automatically."
+    )
+    probe_tool_name = st.selectbox(
+        "Tool compatibility/status check",
+        [row["tool"] for row in tool_status_rows(tool_compatibility)],
+        key="tool_probe_name",
+    )
+    if st.button("Run selected tool check"):
+        with st.spinner(f"Checking {probe_tool_name}…"):
+            result_text = probe_tool(probe_tool_name, model_name)
+        tool_compatibility[probe_tool_name] = result_text
+        st.session_state["tool_compatibility"] = tool_compatibility
+        st.write(result_text)
