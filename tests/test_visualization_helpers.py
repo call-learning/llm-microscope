@@ -2,6 +2,7 @@ import math
 import importlib.util
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pandas as pd
 import torch
@@ -16,7 +17,7 @@ from microscope.analysis import (
     representation_metrics,
 )
 from microscope.interventions import patching_effect_matrix
-from microscope.toolbox import tool_status_rows
+from microscope.toolbox import probe_tool, tool_status_rows
 from microscope.probing import fit_probes
 
 
@@ -114,6 +115,57 @@ class VisualizationHelperTests(unittest.TestCase):
         self.assertIn("capability", transformer_lens)
         self.assertEqual(transformer_lens["compatibility"], "checked")
         self.assertTrue(any("evaluation candidate" in row["tool"] for row in rows))
+
+    def test_visualisation_candidates_report_installation_and_adapter_state(self):
+        rows = tool_status_rows()
+        candidates = {
+            row["tool"]: row
+            for row in rows
+            if "evaluation candidate" in row["tool"]
+        }
+
+        self.assertEqual(
+            set(candidates),
+            {
+                "SAELens (evaluation candidate)",
+                "Pyvene (evaluation candidate)",
+                "BertViz (evaluation candidate)",
+                "CircuitsVis (evaluation candidate)",
+            },
+        )
+        for row in candidates.values():
+            self.assertIn("package", row)
+            self.assertIn("installed", row)
+            self.assertFalse(row["adapter_enabled"])
+            self.assertEqual(row["integration_status"], "Evaluation candidate")
+            self.assertTrue(row["visualization_scope"])
+            self.assertFalse(row["compatibility_checked"])
+
+    def test_unintegrated_tool_status_does_not_require_package_import(self):
+        tool = "BertViz (evaluation candidate)"
+        absent = {row["tool"]: False for row in tool_status_rows()}
+        with patch("microscope.toolbox.installed_tools", return_value=absent):
+            message = probe_tool(tool, "test-model")
+
+        self.assertIn("not installed", message)
+        self.assertIn("No application adapter", message)
+
+    def test_installed_candidate_is_still_reported_as_unintegrated(self):
+        tool = "CircuitsVis (evaluation candidate)"
+        installed = {row["tool"]: False for row in tool_status_rows()}
+        installed[tool] = True
+        with patch("microscope.toolbox.installed_tools", return_value=installed):
+            message = probe_tool(tool, "test-model")
+
+        self.assertIn("is installed", message)
+        self.assertIn("no application adapter", message)
+
+    def test_optional_probe_failure_preserves_core_visualisation_message(self):
+        with patch("microscope.toolbox._probe_tool", side_effect=RuntimeError("provider failed")):
+            message = probe_tool("BertViz (evaluation candidate)", "test-model")
+
+        self.assertIn("provider failed", message)
+        self.assertIn("core visualisations remain available", message)
 
     def test_integrated_gradients_missing_extra_is_actionable(self):
         from microscope.interventions import integrated_gradients

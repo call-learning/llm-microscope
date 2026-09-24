@@ -909,7 +909,9 @@ with tabs[9]:
     )
     st.caption(
         "Optional tools add tracing, interventions, attribution, sparse features, or visualization. "
-        "They are isolated from the core Hugging Face analysis and are never executed automatically."
+        "They are isolated from the core Hugging Face analysis and are never executed automatically. "
+        "Installed means the package is importable; Integration status means this app has an adapter; "
+        "Compatibility contains the result of an explicit check."
     )
     probe_tool_name = st.selectbox(
         "Tool compatibility/status check",
@@ -918,7 +920,16 @@ with tabs[9]:
     )
     if st.button("Run selected tool check"):
         with st.spinner(f"Checking {probe_tool_name}…"):
-            result_text = probe_tool(probe_tool_name, model_name)
+            try:
+                result_text = probe_tool(probe_tool_name, model_name)
+            except Exception as exc:
+                result_text = (
+                    f"{probe_tool_name} is unavailable: {type(exc).__name__}: {exc}. "
+                    "The core visualisations remain available."
+                )
         tool_compatibility[probe_tool_name] = result_text
         st.session_state["tool_compatibility"] = tool_compatibility
-        st.write(result_text)
+        if " is unavailable: " in result_text:
+            st.warning(result_text)
+        else:
+            st.write(result_text)
