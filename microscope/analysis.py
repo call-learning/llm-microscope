@@ -20,6 +20,27 @@ class AnalysisResult:
     attentions: tuple[torch.Tensor, ...] | None
 
 
+def analysis_cache_key(
+    model_name: str,
+    prompt_or_data: str,
+    max_length: int,
+    method: str,
+    target_token_id: int | None = None,
+    layer_range: tuple[int, int] | None = None,
+    artefact: str | None = None,
+) -> tuple[object, ...]:
+    """Build a stable identity for derived analysis data."""
+    return (
+        model_name,
+        prompt_or_data,
+        int(max_length),
+        method,
+        target_token_id,
+        layer_range,
+        artefact,
+    )
+
+
 def analyse(
     runtime: Runtime,
     prompt: str,
@@ -123,6 +144,10 @@ def layer_prediction_metrics(
     for layer, hidden in enumerate(result.hidden_states[1:]):
         logits = project_hidden(runtime, hidden[0])
         probabilities = logits.float().softmax(dim=-1)
+        reference = result.logits[0].float().softmax(dim=-1)
+        kl_to_final = (probabilities * (
+            probabilities.clamp_min(1e-12).log() - reference.clamp_min(1e-12).log()
+        )).sum(dim=-1)
         selected_logits = logits[:, token_id]
         selected_probabilities = probabilities[:, token_id]
         ranks = 1 + (logits > selected_logits.unsqueeze(-1)).sum(dim=-1)
@@ -140,6 +165,7 @@ def layer_prediction_metrics(
                     "probability": float(probability),
                     "rank": int(rank),
                     "entropy": float(position_entropy),
+                    "kl_to_final": float(kl_to_final[position]),
                 }
             )
     return pd.DataFrame(rows)

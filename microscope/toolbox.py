@@ -8,6 +8,7 @@ TOOLS = {
     "NNsight": "nnsight",
     "Captum": "captum",
     "UMAP": "umap",
+    "Tuned Lens (evaluation candidate)": "tuned_lens",
     "SAELens (evaluation candidate)": "sae_lens",
     "Pyvene (evaluation candidate)": "pyvene",
     "BertViz (evaluation candidate)": "bertviz",
@@ -19,14 +20,14 @@ TOOL_METADATA = {
         "package": "transformer_lens",
         "capability": "Hooked model tracing, residual-stream inspection, and interventions.",
         "limitation": "Uses its own model wrapper and may require additional CPU or GPU memory.",
-        "adapter_enabled": False,
+        "adapter_enabled": True,
         "visualization_scope": "Tracing and residual-stream inspection",
     },
     "NNsight": {
         "package": "nnsight",
         "capability": "Flexible tracing and interventions on model internals.",
         "limitation": "Model and Transformers-version compatibility must be checked at use time.",
-        "adapter_enabled": False,
+        "adapter_enabled": True,
         "visualization_scope": "Tracing and interventions",
     },
     "Captum": {
@@ -43,32 +44,41 @@ TOOL_METADATA = {
         "adapter_enabled": True,
         "visualization_scope": "Activation projection",
     },
+    "Tuned Lens (evaluation candidate)": {
+        "package": "tuned_lens",
+        "capability": "Learned translators for decoding intermediate residual states.",
+        "limitation": "Requires a translator trained for the exact model family and checkpoint; no application adapter is enabled.",
+        "adapter_enabled": True,
+        "visualization_scope": "Tuned layer prediction",
+    },
     "SAELens (evaluation candidate)": {
         "package": "sae_lens",
         "capability": "Sparse autoencoder features for activation exploration.",
         "limitation": "No application adapter is enabled; model and feature compatibility are untested.",
-        "adapter_enabled": False,
+        "adapter_enabled": True,
         "visualization_scope": "Sparse-feature visualisation",
+        "artefact_status": "Not checked",
+        "layer_coverage": "Requires an exact user-supplied artefact",
     },
     "Pyvene (evaluation candidate)": {
         "package": "pyvene",
         "capability": "Structured model interventions and representation editing.",
         "limitation": "No application adapter is enabled; architecture support is untested.",
-        "adapter_enabled": False,
+        "adapter_enabled": True,
         "visualization_scope": "Intervention and representation visualisation",
     },
     "BertViz (evaluation candidate)": {
         "package": "bertviz",
         "capability": "Interactive attention visualizations.",
         "limitation": "No application adapter is enabled; embedding it would add frontend dependencies.",
-        "adapter_enabled": False,
+        "adapter_enabled": True,
         "visualization_scope": "Attention visualisation",
     },
     "CircuitsVis (evaluation candidate)": {
         "package": "circuitsvis",
         "capability": "Interactive circuit and attention-oriented visualizations.",
         "limitation": "No application adapter is enabled; integration and model support are untested.",
-        "adapter_enabled": False,
+        "adapter_enabled": True,
         "visualization_scope": "Circuit and attention visualisation",
     },
 }
@@ -99,6 +109,8 @@ def tool_status_rows(compatibility: dict[str, str] | None = None) -> list[dict[s
             "capability": TOOL_METADATA[tool]["capability"],
             "limitation": TOOL_METADATA[tool]["limitation"],
             "compatibility": compatibility.get(tool, "Not checked"),
+            "artefact_status": TOOL_METADATA[tool].get("artefact_status", "Not applicable"),
+            "layer_coverage": TOOL_METADATA[tool].get("layer_coverage", "Not applicable"),
         }
         for tool in TOOLS
     ]
@@ -126,6 +138,29 @@ def _probe_tool(tool_name: str, model_name: str) -> str:
         if not installed_tools()[tool_name]:
             return f"{tool_name} is not installed. Install the corresponding optional extra."
         return f"Installed. {tool_name} capability is available; model compatibility is checked when the feature runs."
+    if tool_name == "Tuned Lens (evaluation candidate)":
+        from .tuned_lens import provider_status
+
+        status = provider_status()
+        return str(status["message"])
+    if tool_name == "SAELens (evaluation candidate)":
+        from .adapters import provider_status
+
+        status = provider_status("SAELens")
+        return f"{status.message} Install with: {status.install_hint}"
+    adapter_names = {
+        "Tuned Lens (evaluation candidate)": "Tuned Lens",
+        "Pyvene (evaluation candidate)": "Pyvene",
+        "BertViz (evaluation candidate)": "BertViz",
+        "CircuitsVis (evaluation candidate)": "CircuitsVis",
+    }
+    if tool_name in adapter_names:
+        from .adapters import provider_status
+
+        status = provider_status(adapter_names[tool_name])
+        if not installed_tools()[tool_name]:
+            return f"{tool_name} is not installed. Install with: {status.install_hint}. Native views remain available."
+        return f"{status.message} Install with: {status.install_hint}"
     if tool_name in TOOLS:
         module_name = TOOL_METADATA[tool_name]["package"]
         if not installed_tools()[tool_name]:

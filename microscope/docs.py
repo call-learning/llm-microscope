@@ -26,7 +26,7 @@ from __future__ import annotations
 
 # Top-of-page copy (not tied to a single tab).
 APP_TITLE = "🔬 LLM Microscope"
-APP_SUBTITLE = "Local interpretability workbench — logit lens, attention, activations, attribution and causal patching"
+APP_SUBTITLE = "Local interpretability workbench — layers, attention, mechanisms, validity and causal patching"
 SIDEBAR_MODEL_CAPTION = "Changing the model reloads it. Start with 1.7B on a 12 GB GPU."
 APP_GUIDE = """
 **What is this?** LLM Microscope is a learning and investigation workbench for
@@ -234,6 +234,18 @@ VIEWS: dict[str, dict] = {
         "what": "Status, capabilities, limitations, and explicit compatibility checks for optional research integrations such as Captum, UMAP, NNsight, and TransformerLens, plus evaluation candidates.",
         "why": "Shows which optional libraries are installed and what kind of work they add: tracing, interventions, attribution, sparse features, or visualization. They are not required for the core tabs and are never run automatically.",
         "know": "No prior knowledge is needed. An installation status is not a compatibility guarantee; a compatibility check is a technical environment check, not an analysis of the prompt.",
+        "examples": [],
+    },
+    "Mechanistic": {
+        "what": "Runs controlled ablation curves and fine-grained inspections of residuals, attention heads, MLP neurons, Q/K/V signals, source-to-target paths, and validated SAE features.",
+        "why": "Separates where a feature may be represented from which component or path is necessary for this particular prediction.",
+        "know": "Activations and Q/K/V magnitudes are descriptive; ablations are causal interventions under one replacement. Redundancy, distribution shift, and the selected output token affect the result.",
+        "examples": [],
+    },
+    "Validity": {
+        "what": "Reports prediction uncertainty, labelled calibration metrics, reliability curves, and answer changes across explicit prompt variants.",
+        "why": "Helps test whether confidence is reliable and whether an answer is sensitive to controlled changes in the prompt.",
+        "know": "A language model has no single internal truth checker. Calibration and consistency require labels or references and are not guarantees of correctness.",
         "examples": [],
     },
 }

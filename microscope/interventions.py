@@ -275,6 +275,95 @@ def patching_effect_matrix(
     return pd.DataFrame(rows).set_index("patch target")
 
 
+def ablation_effect_curve(
+    runtime: Runtime,
+    prompt: str,
+    target: PatchTarget = PatchTarget.RESIDUAL,
+    max_length: int = 128,
+    target_token_id: int | None = None,
+    head_idx: int = 0,
+) -> pd.DataFrame:
+    """Measure the selected-token effect of zero ablation at every layer.
+
+    The unmodified prompt is evaluated once. Each subsequent forward removes
+    only the final-token output of one selected component, so results are
+    comparable across layers and targets.
+    """
+    batch = tokenize(runtime, prompt, max_length=max_length)
+    with torch.inference_mode():
+        baseline = runtime.model(**batch, use_cache=False).logits[0, -1].float()
+    if target_token_id is None:
+        target_token_id = int(baseline.argmax())
+    if target_token_id < 0 or target_token_id >= baseline.numel():
+        raise ValueError("Target token ID is outside the vocabulary.")
+
+    rows = []
+    baseline_value = float(baseline[target_token_id])
+    baseline_probability = float(baseline.softmax(dim=-1)[target_token_id])
+    for layer_idx in range(len(runtime.layers)):
+        if target is PatchTarget.ATTN_OUTPUT:
+            module, _ = layer_modules(runtime.layers[layer_idx])
+        elif target is PatchTarget.MLP_OUTPUT:
+            _, module = layer_modules(runtime.layers[layer_idx])
+        else:
+            module = runtime.layers[layer_idx]
+        if module is None:
+            raise ValueError(f"Layer {layer_idx} does not expose the selected component.")
+
+        if target is PatchTarget.ATTN_OUTPUT and hasattr(module, "o_proj"):
+            # The input to o_proj is the per-head attention result in common
+            # decoder implementations. Zero only one head before projection.
+            projection = module.o_proj
+
+            def ablate_head(_module, inputs):
+                if not inputs:
+                    raise ValueError("Attention projection did not expose head inputs.")
+                value = inputs[0].clone()
+                if value.ndim == 4:
+                    if head_idx < 0 or head_idx >= value.shape[2]:
+                        raise ValueError(f"Attention head {head_idx} is outside the available range.")
+                    value[:, -1, head_idx, :] = 0
+                elif value.ndim == 3:
+                    n_heads = getattr(runtime.model.config, "num_attention_heads", 0)
+                    if not n_heads or value.shape[-1] % n_heads:
+                        raise ValueError("Attention projection input cannot be split into heads.")
+                    head_dim = value.shape[-1] // n_heads
+                    if head_idx < 0 or head_idx >= n_heads:
+                        raise ValueError(f"Attention head {head_idx} is outside the available range.")
+                    value[:, -1, head_idx * head_dim:(head_idx + 1) * head_dim] = 0
+                else:
+                    raise ValueError("Attention projection input has an unsupported shape.")
+                return (value, *inputs[1:])
+
+            handle = projection.register_forward_pre_hook(ablate_head)
+        else:
+            def ablate(_module, _inputs, output):
+                hidden = output[0] if isinstance(output, tuple) else output
+                replacement = torch.zeros_like(hidden[:, -1:, :])
+                return _replace_final_token(output, replacement)
+
+            handle = module.register_forward_hook(ablate)
+        try:
+            with torch.inference_mode():
+                ablated = runtime.model(**batch, use_cache=False).logits[0, -1].float()
+        finally:
+            handle.remove()
+        probability = float(ablated.softmax(dim=-1)[target_token_id])
+        rows.append({
+            "layer": layer_idx,
+            "target": target.value,
+            "head_idx": head_idx if target is PatchTarget.ATTN_OUTPUT else None,
+            "target_token_id": target_token_id,
+            "baseline_logit": baseline_value,
+            "ablated_logit": float(ablated[target_token_id]),
+            "delta_logit": float(ablated[target_token_id] - baseline_value),
+            "baseline_probability": baseline_probability,
+            "ablated_probability": probability,
+            "delta_probability": probability - baseline_probability,
+        })
+    return pd.DataFrame(rows)
+
+
 def patch_final_residual(
     runtime: Runtime,
     source_prompt: str,

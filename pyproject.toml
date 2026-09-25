@@ -6,12 +6,15 @@ readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
   "accelerate>=1.2",
+  "bertviz>=1.4",
+  "circuitsvis>=1.43",
   "numpy>=1.26",
   "pandas>=2.2",
   "plotly>=5.24",
   "safetensors>=0.4",
   "scikit-learn>=1.5",
   "streamlit>=1.41",
+  "tuned-lens>=0.2",
   "transformers>=4.51,<6",
   # Needed so transformers' vision processors import cleanly (Streamlit's
   # source watcher introspects every module, including vitmatte/vitpose,
@@ -25,11 +28,15 @@ captum = ["captum>=0.7"]
 umap = ["umap-learn>=0.5"]
 nnsight = ["nnsight>=0.4"]
 transformer-lens = ["transformer-lens>=2.15"]
+saelens = ["sae-lens>=0.3"]
+pyvene = ["pyvene>=0.1"]
 all = [
   "captum>=0.7",
   "umap-learn>=0.5",
   "nnsight>=0.4",
   "transformer-lens>=2.15",
+  "sae-lens>=0.3",
+  "pyvene>=0.1",
 ]
 
 [tool.uv]
@@ -43,4 +50,3 @@ torchvision = { index = "pytorch" }
 name = "pytorch"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
-

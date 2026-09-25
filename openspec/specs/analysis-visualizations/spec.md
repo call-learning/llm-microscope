@@ -76,3 +76,62 @@ The system SHALL compute expensive visualisation data on user request, reuse com
 
 - **WHEN** a requested view can be derived from the current analysis result without new inference
 - **THEN** the system SHALL derive the view from that result rather than rerunning the model unnecessarily
+
+### Requirement: Tuned layer prediction view
+
+The system SHALL optionally provide a tuned-lens view that translates intermediate residual states before decoding them, alongside the existing raw logit lens.
+
+#### Scenario: User compares raw and tuned lens
+
+- **WHEN** a compatible tuned-lens provider and artefact are available
+- **THEN** the system SHALL show layer-wise predictions for both the raw and tuned methods
+- **AND** the view SHALL identify the selected method, layer, token, and model artefact
+- **AND** it SHALL explain that neither method is a literal record of the model's completed reasoning
+
+#### Scenario: Tuned lens is unavailable
+
+- **WHEN** no compatible tuned-lens artefact or provider is available
+- **THEN** the existing raw logit-lens view SHALL remain usable
+- **AND** the interface SHALL report the specific compatibility or installation boundary
+
+### Requirement: Component contribution visualisation
+
+The system SHALL provide a view that compares the contribution of embeddings, attention outputs, MLP outputs, and residual updates to a selected output logit when the model architecture exposes the required values.
+
+#### Scenario: User inspects a selected output token
+
+- **WHEN** the user selects an output token and runs component analysis
+- **THEN** the system SHALL display signed component contributions by layer
+- **AND** it SHALL identify whether values are direct, projected, or cumulative estimates
+
+#### Scenario: Architecture does not expose components
+
+- **WHEN** the selected architecture cannot provide a component decomposition
+- **THEN** the interface SHALL preserve the existing layer and activation views
+- **AND** it SHALL explain why component analysis is unavailable rather than showing fabricated zeros
+
+### Requirement: Visual interpretation boundaries
+
+Each layer visualisation SHALL identify whether it is descriptive, correlational, or intervention-based and SHALL expose the selected prompt, token, layer range, and method assumptions.
+
+#### Scenario: User opens a layer visualisation
+
+- **WHEN** the user opens a raw lens, tuned lens, or component view
+- **THEN** the interface SHALL identify the method and its interpretation category
+- **AND** it SHALL show the prompt, selected token, and relevant layer range
+
+### Requirement: Optional provider rendering
+
+The system SHALL allow a compatible optional provider to render a labelled attention, circuit, tracing, or sparse-feature view while preserving the equivalent native view as a fallback.
+
+#### Scenario: BertViz or CircuitsVis renders successfully
+
+- **WHEN** the provider is installed, compatible, and explicitly selected
+- **THEN** the interface SHALL identify the provider, model, tokens, and represented layers/heads/features
+- **AND** the native Plotly view SHALL remain available
+
+#### Scenario: Browser-oriented rendering is unavailable
+
+- **WHEN** a provider cannot render inside the current Streamlit/browser context
+- **THEN** the interface SHALL report the rendering boundary
+- **AND** it SHALL show the native Plotly equivalent when available

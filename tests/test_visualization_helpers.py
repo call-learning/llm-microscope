@@ -1,5 +1,6 @@
 import math
 import importlib.util
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,9 +17,14 @@ from microscope.analysis import (
     pairwise_cosine_distances,
     representation_metrics,
 )
-from microscope.interventions import patching_effect_matrix
+from microscope.interventions import PatchTarget, ablation_effect_curve, patching_effect_matrix
 from microscope.toolbox import probe_tool, tool_status_rows
 from microscope.probing import fit_probes
+from microscope.validity import calibration_metrics, compare_variants, prediction_uncertainty
+from microscope.tuned_lens import decode_artifact, load_artifact
+from microscope.components import component_cache_key, component_capabilities
+from microscope.sae import ablate_feature, encode as encode_sae, load_artifact as load_sae_artifact
+from microscope.adapters import bertviz_attention, circuitsvis_attention, provider_status
 
 
 def fake_runtime() -> SimpleNamespace:
@@ -131,13 +137,14 @@ class VisualizationHelperTests(unittest.TestCase):
                 "Pyvene (evaluation candidate)",
                 "BertViz (evaluation candidate)",
                 "CircuitsVis (evaluation candidate)",
+                "Tuned Lens (evaluation candidate)",
             },
         )
         for row in candidates.values():
             self.assertIn("package", row)
             self.assertIn("installed", row)
-            self.assertFalse(row["adapter_enabled"])
-            self.assertEqual(row["integration_status"], "Evaluation candidate")
+            self.assertTrue(row["adapter_enabled"])
+            self.assertEqual(row["integration_status"], "Integrated")
             self.assertTrue(row["visualization_scope"])
             self.assertFalse(row["compatibility_checked"])
 
@@ -148,7 +155,7 @@ class VisualizationHelperTests(unittest.TestCase):
             message = probe_tool(tool, "test-model")
 
         self.assertIn("not installed", message)
-        self.assertIn("No application adapter", message)
+        self.assertIn("Native views remain available", message)
 
     def test_installed_candidate_is_still_reported_as_unintegrated(self):
         tool = "CircuitsVis (evaluation candidate)"
@@ -157,8 +164,7 @@ class VisualizationHelperTests(unittest.TestCase):
         with patch("microscope.toolbox.installed_tools", return_value=installed):
             message = probe_tool(tool, "test-model")
 
-        self.assertIn("is installed", message)
-        self.assertIn("no application adapter", message)
+        self.assertIn("ready for an explicit compatibility check", message)
 
     def test_optional_probe_failure_preserves_core_visualisation_message(self):
         with patch("microscope.toolbox._probe_tool", side_effect=RuntimeError("provider failed")):
@@ -174,6 +180,131 @@ class VisualizationHelperTests(unittest.TestCase):
             self.skipTest("Captum is installed in this environment")
         with self.assertRaisesRegex(RuntimeError, "captum"):
             integrated_gradients(None, "test")
+
+    def test_uncertainty_and_calibration_metrics_are_explicit(self):
+        metrics = prediction_uncertainty(torch.tensor([2.0, 1.0, 0.0]))
+        self.assertEqual(metrics["top1_id"], 0)
+        self.assertGreater(metrics["top1_margin"], 0)
+
+        summary, bins = calibration_metrics([0.9, 0.8, 0.2, 0.1], [1, 1, 0, 0])
+        self.assertEqual(summary["n_examples"], 4)
+        self.assertEqual(int(bins["count"].sum()), 4)
+        self.assertEqual(summary["accuracy"], 0.5)
+
+    def test_variant_comparison_preserves_first_answer_reference(self):
+        result = compare_variants([
+            {"variant": "base", "token": " Paris", "probability": 0.8, "entropy": 1.0},
+            {"variant": "masked", "token": " London", "probability": 0.4, "entropy": 1.5},
+        ])
+        self.assertTrue(bool(result.iloc[0]["agreement_with_first"]))
+        self.assertFalse(bool(result.iloc[1]["agreement_with_first"]))
+
+    def test_ablation_curve_cleans_hooks_and_keeps_baseline_metadata(self):
+        class ToyModel(torch.nn.Module):
+            def __init__(self, layers, head):
+                super().__init__()
+                self.layers = torch.nn.ModuleList(layers)
+                self.head = head
+
+            def forward(self, **kwargs):
+                state = kwargs["input_ids"].float()
+                for layer in self.layers:
+                    state = layer(state)
+                return SimpleNamespace(logits=self.head(state))
+
+        layers = [torch.nn.Linear(2, 2, bias=False) for _ in range(2)]
+        head = torch.nn.Linear(2, 3, bias=False)
+        runtime = SimpleNamespace(
+            model=ToyModel(layers, head), layers=layers,
+            device=torch.device("cpu"),
+        )
+        with patch("microscope.interventions.tokenize", return_value={"input_ids": torch.ones(1, 1, 2)}):
+            curve = ablation_effect_curve(runtime, "test", PatchTarget.RESIDUAL)
+        self.assertEqual(len(curve), 2)
+        self.assertIn("baseline_logit", curve)
+        self.assertTrue(all(not layer._forward_hooks for layer in layers))
+
+    def test_attention_head_ablation_uses_projection_pre_hook(self):
+        class Attention(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.o_proj = torch.nn.Linear(4, 4, bias=False)
+
+            def forward(self, value):
+                return self.o_proj(value)
+
+        class Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = Attention()
+
+            def forward(self, value):
+                return self.self_attn(value)
+
+        class Model(torch.nn.Module):
+            def __init__(self, layers):
+                super().__init__()
+                self.layers = torch.nn.ModuleList(layers)
+                self.config = SimpleNamespace(num_attention_heads=2)
+                self.head = torch.nn.Linear(4, 3, bias=False)
+
+            def forward(self, **kwargs):
+                value = kwargs["input_ids"].float()
+                for layer in self.layers:
+                    value = layer(value)
+                return SimpleNamespace(logits=self.head(value))
+
+        layers = [Layer()]
+        runtime = SimpleNamespace(model=Model(layers), layers=layers, device=torch.device("cpu"))
+        with patch("microscope.interventions.tokenize", return_value={"input_ids": torch.ones(1, 1, 4)}):
+            curve = ablation_effect_curve(runtime, "test", PatchTarget.ATTN_OUTPUT, head_idx=1)
+        self.assertEqual(curve.iloc[0]["head_idx"], 1)
+
+    def test_native_tuned_lens_artifact_requires_exact_model_and_layers(self):
+        payload = {
+            "model_name": "test-model",
+            "hidden_size": 3,
+            "weights": [torch.eye(3)],
+            "biases": [torch.zeros(3)],
+        }
+        with tempfile.NamedTemporaryFile(suffix=".pt") as file:
+            torch.save(payload, file.name)
+            artifact = load_artifact(file.name, "test-model", 3)
+        runtime = fake_runtime()
+        translated = decode_artifact(runtime, fake_result(runtime).hidden_states, artifact, 1)
+        self.assertEqual(len(translated), 1)
+        self.assertEqual(int(translated.iloc[0]["token_id"]), 1)
+
+    def test_component_capabilities_and_cache_identity_are_explicit(self):
+        runtime = SimpleNamespace(layers=[object()], model=SimpleNamespace(config=SimpleNamespace()))
+        capabilities = component_capabilities(runtime, 0)
+        self.assertFalse(capabilities.mlp_neurons)
+        self.assertIn("not expose", capabilities.reason)
+        key = component_cache_key("model", "prompt", 2, "mlp-neuron", (1,), neuron=4, intervention="zero")
+        self.assertIn("mlp-neuron", key)
+
+    def test_sae_artifact_validation_and_feature_ablation(self):
+        payload = {
+            "model_name": "test-model", "layer": 1, "hidden_size": 3,
+            "encoder": torch.eye(3), "decoder": torch.eye(3), "threshold": 0.0,
+        }
+        with tempfile.NamedTemporaryFile(suffix=".pt") as file:
+            torch.save(payload, file.name)
+            artifact = load_sae_artifact(file.name, "test-model", 1, 3)
+        activations = torch.tensor([[1.0, 0.0, 2.0]])
+        features = encode_sae(activations, artifact)
+        ablated = ablate_feature(activations, artifact, 2)
+        self.assertEqual(features.shape, (1, 3))
+        self.assertEqual(float(ablated[0, 2]), 0.0)
+
+    def test_optional_visual_adapters_return_labeled_html(self):
+        attention = (torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]]),)
+        bert = bertviz_attention(attention, ["0: a", "1: b"])
+        circuits = circuitsvis_attention(attention[0], ["0: a", "1: b"])
+        self.assertEqual(bert.kind, "html")
+        self.assertEqual(circuits.kind, "html")
+        self.assertIn("tokens", bert.labels)
+        self.assertTrue(provider_status("BertViz").adapter_ready)
 
     def test_probe_reports_heldout_and_training_only_modes(self):
         class Batch(dict):

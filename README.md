@@ -16,6 +16,8 @@ The working views use Hugging Face directly, so the app remains useful even if a
 - causal residual-stream activation patching;
 - gradient × input attribution;
 - optional TransformerLens and NNsight probes.
+- component ablation curves and confidence/calibration/variant-sensitivity views.
+- MLP neuron, attention Q/K/V, component-path, and validated SAE feature inspection.
 
 ## Quick start
 
@@ -23,7 +25,7 @@ You need Python 3.11 or 3.12 and a CUDA-enabled PyTorch installation. The setup 
 
 ### With `uv` (recommended)
 
-The one-shot setup script installs `uv` if missing, detects an existing CUDA PyTorch, creates `.venv`, and syncs all project dependencies from `uv.lock`:
+The one-shot setup script installs `uv` if missing, detects an existing CUDA PyTorch, creates `.venv`, and syncs all project dependencies from `uv.lock`. BertViz, CircuitsVis, and Tuned Lens are installed as direct project dependencies:
 
 ```bash
 unzip llm-microscope.zip
@@ -43,7 +45,7 @@ Equivalent low-level commands:
 ```bash
 uv venv -p 3.12
 uv pip install --python .venv/bin/python torch --index-url https://download.pytorch.org/whl/cu130
-uv sync --extra captum --extra umap
+uv sync
 ```
 
 ### With `pip` (no uv)
@@ -66,7 +68,7 @@ uv run python scripts/check_environment.py   # or: make check
 
 ## Optional research integrations
 
-Install individually because these libraries evolve quickly and may constrain PyTorch or Transformers versions:
+The remaining research integrations are optional because they may constrain PyTorch or Transformers versions:
 
 ```bash
 uv sync --extra nnsight
@@ -79,7 +81,7 @@ Or install everything:
 uv sync --all-extras
 ```
 
-The **Toolbox** page detects installed integrations and runs small smoke probes. The main analysis pages do not depend on NNsight or TransformerLens.
+The **Toolbox** page detects installed integrations and runs small smoke probes. BertViz and CircuitsVis are rendering-only descriptive attention providers; Tuned Lens and SAELens are artefact-based layer/feature providers; TransformerLens, NNsight, and Pyvene are wrapper/intervention providers; Captum and UMAP are native analysis helpers. Provider failures never replace or disable the native Hugging Face/Plotly views.
 
 ## Suggested first experiments
 
@@ -102,5 +104,7 @@ The **Toolbox** page detects installed integrations and runs small smoke probes.
 - A logit lens decodes intermediate representations through the final normalization and language-model head; the model does not literally make a prediction at every layer.
 - Gradient attribution is local and sensitive to the selected output token.
 - Activation patching provides causal evidence for the patched state, but does not automatically identify a human-readable concept.
+- Confidence, calibration, and consistency are empirical reliability signals; they do not constitute factuality verification.
+- The workbench does not expose a single internal “validity checker”: use labelled calibration data and controlled variants when assessing reliability.
+- Fine-grained neuron, head, and SAE activations are model-dependent signals, not automatically human-readable concepts.
 - `trust_remote_code` is disabled by default. Only enable it for a repository you trust.
-

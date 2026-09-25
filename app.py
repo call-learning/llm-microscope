@@ -13,6 +13,7 @@ from microscope.analysis import (
     attention_head_similarity,
     attention_head_summary,
     attention_rollout,
+    analysis_cache_key,
     final_token_evolution,
     layer_norms,
     layer_prediction_metrics,
@@ -30,6 +31,7 @@ from microscope.interventions import (
     patching_effect_matrix,
     patching_score_curve,
     integrated_gradients,
+    ablation_effect_curve,
 )
 from microscope.probing import (
     ProbeResult,
@@ -47,6 +49,18 @@ from microscope.docs import (
 )
 from microscope.runtime import cuda_stats, layer_modules, load_runtime
 from microscope.toolbox import probe_tool, tool_status_rows
+from microscope.validity import calibration_metrics, compare_variants, prediction_uncertainty
+from microscope.tuned_lens import decode_artifact, load_artifact
+from microscope.components import component_capabilities
+from microscope.fine_grained import (
+    ablate_mlp_neuron,
+    attention_signal_summary,
+    mlp_neuron_activations,
+    patch_mlp_neuron,
+    top_mlp_neurons,
+)
+from microscope.sae import ablate_feature, encode as encode_sae, load_artifact as load_sae_artifact
+from microscope.adapters import bertviz_attention, circuitsvis_attention
 
 
 st.set_page_config(page_title="LLM Microscope", page_icon="🔬", layout="wide")
@@ -125,7 +139,7 @@ def show_intro(tab_name: str) -> None:
 
 def analysis_identity(model_name: str, prompt: str, max_length: int) -> tuple[str, str, int]:
     """Identify derived visual data belonging to the current analysis inputs."""
-    return model_name, prompt, max_length
+    return analysis_cache_key(model_name, prompt, max_length, "forward")[:3]
 
 
 with st.sidebar:
@@ -217,6 +231,8 @@ tabs = st.tabs(
         "Attribution",
         "Linear Probe",
         "Toolbox",
+        "Mechanistic",
+        "Validity",
     ]
 )
 
@@ -349,6 +365,49 @@ with tabs[2]:
             px.line(evolution, x="layer", y="probability", markers=True),
             width="stretch",
         )
+        st.subheader("Optional tuned-lens comparison")
+        st.caption(
+            "A tuned lens uses a separately trained per-layer translator. It is only valid for an exact "
+            "model/checkpoint and hidden size; raw logit lens remains the fallback."
+        )
+        tuned_path = st.text_input(
+            "Native tuned-lens artefact path (optional)", key="tuned_lens_path",
+            help="Checkpoint dictionary with model_name, hidden_size, weights and biases lists.",
+        )
+        tuned_token = st.number_input("Token ID to compare", min_value=0, value=0, step=1,
+                                      key="tuned_lens_token")
+        if st.button("Compare raw and tuned lens"):
+            try:
+                artifact = load_artifact(
+                    tuned_path, runtime.model_name, int(result.hidden_states[-1].shape[-1])
+                )
+                tuned = decode_artifact(
+                    runtime, result.hidden_states, artifact, int(tuned_token), result.logits[0, -1]
+                )
+                raw = layer_prediction_metrics(runtime, result, int(tuned_token))
+                raw = raw[raw["position"] == len(result.labels) - 1]
+                raw = raw[["layer", "probability", "rank", "kl_to_final"]].copy()
+                raw["method"] = "Raw logit lens"
+                tuned_plot = tuned[["layer", "probability", "rank", "kl_to_final"]].copy()
+                tuned_plot["method"] = "Tuned lens"
+                comparison = pd.concat([raw, tuned_plot])
+                st.plotly_chart(
+                    px.line(comparison, x="layer", y="probability", color="method", markers=True,
+                            labels={"probability": "Selected-token probability"}),
+                    width="stretch",
+                )
+                st.plotly_chart(
+                    px.line(comparison, x="layer", y="kl_to_final", color="method", markers=True,
+                            labels={"kl_to_final": "KL divergence from final distribution"}),
+                    width="stretch",
+                )
+                st.dataframe(comparison, width="stretch", hide_index=True)
+                st.caption(
+                    "Both curves are diagnostic decodings, not literal records of completed reasoning. "
+                    "The tuned curve is meaningful only for its validated artefact."
+                )
+            except Exception as exc:
+                st.warning(f"Tuned lens unavailable: {type(exc).__name__}: {exc}. Raw logit lens remains available.")
 
 with tabs[3]:
     show_intro("Attention")
@@ -374,6 +433,24 @@ with tabs[3]:
             title=f"Layer {layer}, head {head}",
         )
         st.plotly_chart(fig, width="stretch")
+
+        optional_attention_view = st.selectbox(
+            "Optional attention renderer",
+            ["Native Plotly", "BertViz", "CircuitsVis"],
+            key="optional_attention_view",
+        )
+        if optional_attention_view != "Native Plotly" and st.button("Render optional attention view"):
+            try:
+                if optional_attention_view == "BertViz":
+                    rendered = bertviz_attention(result.attentions, result.labels, layer=layer, heads=[head])
+                else:
+                    rendered = circuitsvis_attention(result.attentions[layer], result.labels, heads=[head])
+                import streamlit.components.v1 as components
+
+                components.html(rendered.value, height=620, scrolling=True)
+                st.caption(f"{rendered.provider}: {rendered.assumptions}")
+            except Exception as exc:
+                st.warning(f"{optional_attention_view} unavailable: {type(exc).__name__}: {exc}. Native Plotly remains available.")
 
         summary = attention_head_summary(result.attentions, result.labels)
         selected_summary = summary[
@@ -933,3 +1010,288 @@ with tabs[9]:
             st.warning(result_text)
         else:
             st.write(result_text)
+
+with tabs[10]:
+    page_intro(
+        "Mechanistic analysis compares which components influence a selected prediction. "
+        "Zero-ablation curves are interventions, not explanations of human-readable concepts.",
+        "Compare representation and causal influence across residual, attention, and MLP components.",
+        "Ablation measures output sensitivity under one intervention and can be confounded by redundancy.",
+    )
+    st.subheader("Component ablation curve")
+    st.caption(
+        "The baseline is run once, then one final-token component is zeroed at each layer. "
+        "A negative delta means the ablated component supported the selected token's score."
+    )
+    mechanistic_target_label = st.selectbox(
+        "Component target", ["Residual", "Attention output", "MLP output"], key="mechanistic_target"
+    )
+    mechanistic_target = {
+        "Residual": PatchTarget.RESIDUAL,
+        "Attention output": PatchTarget.ATTN_OUTPUT,
+        "MLP output": PatchTarget.MLP_OUTPUT,
+    }[mechanistic_target_label]
+    mechanistic_head = 0
+    if mechanistic_target is PatchTarget.ATTN_OUTPUT:
+        n_heads = getattr(runtime.model.config, "num_attention_heads", 1)
+        mechanistic_head = st.slider("Attention head", 0, max(0, n_heads - 1), 0,
+                                     key="mechanistic_head")
+    target_token_text = st.text_input(
+        "Selected output token ID (blank = baseline top token)", key="mechanistic_token_id"
+    )
+    if st.button("Run component curve"):
+        try:
+            selected_token = int(target_token_text) if target_token_text.strip() else None
+            with st.spinner("Running one baseline and one ablation per layer…"):
+                st.session_state["mechanistic_curve"] = ablation_effect_curve(
+                    runtime, prompt, target=mechanistic_target, max_length=max_length,
+                    target_token_id=selected_token, head_idx=mechanistic_head,
+                )
+        except Exception as exc:
+            st.error(f"Mechanistic analysis failed: {type(exc).__name__}: {exc}")
+    curve = st.session_state.get("mechanistic_curve")
+    if curve is not None:
+        st.plotly_chart(
+            px.line(curve, x="layer", y="delta_logit", markers=True,
+                    labels={"delta_logit": "Ablated − baseline logit"},
+                    title=f"Zero-ablation effect: {curve.iloc[0]['target']}"),
+            width="stretch",
+        )
+        st.dataframe(curve, width="stretch", hide_index=True)
+        st.warning(
+            "A component can be represented without being necessary for this output, "
+            "and an ablation effect does not identify a semantic concept."
+        )
+        probe = st.session_state.get("probe_result")
+        if probe is not None:
+            st.subheader("Decodability versus causal influence")
+            probe_curve = probe.per_layer_accuracy[["layer", "accuracy"]].copy()
+            probe_curve["measure"] = "Probe accuracy"
+            causal_curve = curve[["layer", "delta_logit"]].copy()
+            causal_curve["measure"] = "Ablation logit delta"
+            causal_curve = causal_curve.rename(columns={"delta_logit": "accuracy"})
+            comparison = pd.concat([
+                probe_curve[["layer", "accuracy", "measure"]],
+                causal_curve[["layer", "accuracy", "measure"]],
+            ])
+            st.plotly_chart(
+                px.line(comparison, x="layer", y="accuracy", color="measure", markers=True,
+                        labels={"accuracy": "Metric value"}),
+                width="stretch",
+            )
+            st.caption(
+                "Probe accuracy measures whether a property is decodable; the intervention curve "
+                "measures effect on one output. They are not expected to match."
+            )
+
+    st.divider()
+    st.subheader("MLP neuron inspection")
+    fine_layer = st.number_input("Fine-grained layer", 0, len(runtime.layers) - 1,
+                                 len(runtime.layers) // 2, key="fine_layer")
+    capabilities = component_capabilities(runtime, int(fine_layer))
+    if not capabilities.mlp_neurons:
+        st.warning(f"MLP neuron inspection unavailable: {capabilities.reason}")
+    else:
+        if st.button("Inspect MLP neurons"):
+            try:
+                with st.spinner("Capturing MLP intermediate activations…"):
+                    neuron_data = mlp_neuron_activations(runtime, prompt, int(fine_layer), max_length)
+                st.session_state["neuron_data"] = neuron_data
+            except Exception as exc:
+                st.warning(f"MLP inspection unavailable: {type(exc).__name__}: {exc}")
+        neuron_data = st.session_state.get("neuron_data")
+        if neuron_data is not None:
+            top_neurons = top_mlp_neurons(neuron_data)
+            st.dataframe(top_neurons, width="stretch", hide_index=True)
+            selected_neuron = st.number_input(
+                "Neuron index", 0, int(neuron_data["neuron"].max()), 0, key="fine_neuron"
+            )
+            selected_position = st.number_input(
+                "Token position", 0, len(result.labels) - 1 if result is not None else 0,
+                len(result.labels) - 1 if result is not None else 0, key="fine_position"
+            )
+            neuron_slice = neuron_data[neuron_data["neuron"] == selected_neuron]
+            st.plotly_chart(
+                px.line(neuron_slice, x="position", y="activation", markers=True,
+                        title=f"MLP neuron {selected_neuron} activation by token position"),
+                width="stretch",
+            )
+            if st.button("Ablate selected neuron"):
+                try:
+                    baseline, ablated, metadata = ablate_mlp_neuron(
+                        runtime, prompt, int(fine_layer), int(selected_neuron),
+                        int(selected_position), max_length=max_length,
+                    )
+                    st.write(metadata)
+                    left, right = st.columns(2)
+                    left.dataframe(baseline, width="stretch", hide_index=True)
+                    right.dataframe(ablated, width="stretch", hide_index=True)
+                except Exception as exc:
+                    st.warning(f"Neuron ablation unavailable: {type(exc).__name__}: {exc}")
+
+    st.subheader("Attention Q/K/V signals")
+    signal_kind = st.selectbox("Signal", ["q", "k", "v"], key="fine_signal")
+    signal_head = st.number_input("Signal head (-1 = all heads)", -1, max(0, capabilities.attention_head_count - 1),
+                                  -1, key="fine_signal_head")
+    if not capabilities.attention_qkv:
+        st.warning(f"Q/K/V inspection unavailable: {capabilities.reason}")
+    elif st.button("Inspect attention signal"):
+        try:
+            signal_data = attention_signal_summary(
+                runtime, prompt, int(fine_layer), signal_kind,
+                None if signal_head < 0 else int(signal_head), max_length,
+            )
+            st.dataframe(signal_data, width="stretch", hide_index=True)
+            st.plotly_chart(
+                px.line(signal_data, x="position", y="magnitude", color="head", markers=True,
+                        title=f"{signal_kind.upper()} vector magnitude (not attention weight)"),
+                width="stretch",
+            )
+        except Exception as exc:
+            st.warning(f"Attention signal unavailable: {type(exc).__name__}: {exc}")
+
+    st.subheader("MLP-neuron source → target path")
+    path_source = st.text_input("Path source prompt", "The capital of France is", key="fine_path_source")
+    path_target = st.text_input("Path target prompt", "The capital of Germany is", key="fine_path_target")
+    if st.button("Run neuron path intervention"):
+        try:
+            neuron = int(st.session_state.get("fine_neuron", 0))
+            baseline, patched, metadata = patch_mlp_neuron(
+                runtime, path_source, path_target, int(fine_layer), neuron, max_length=max_length,
+            )
+            st.write(metadata)
+            left, right = st.columns(2)
+            left.dataframe(baseline, width="stretch", hide_index=True)
+            right.dataframe(patched, width="stretch", hide_index=True)
+            path_chart = pd.DataFrame([
+                {"run": "Baseline", "token": baseline.iloc[0]["token"], "probability": baseline.iloc[0]["probability"]},
+                {"run": "Neuron path", "token": patched.iloc[0]["token"], "probability": patched.iloc[0]["probability"]},
+            ])
+            st.plotly_chart(
+                px.bar(path_chart, x="run", y="probability", color="token",
+                       title="Path intervention top-token comparison"),
+                width="stretch",
+            )
+            st.caption("This is evidence for one intervention path, not an automatically discovered circuit.")
+        except Exception as exc:
+            st.warning(f"Neuron path unavailable: {type(exc).__name__}: {exc}")
+
+    st.subheader("Optional SAE feature inspection")
+    sae_path = st.text_input("SAE artefact path (optional)", key="sae_path")
+    if st.button("Load SAE features"):
+        try:
+            hidden = result.hidden_states[int(fine_layer) + 1][0]
+            sae = load_sae_artifact(
+                sae_path, runtime.model_name, int(fine_layer), int(hidden.shape[-1])
+            )
+            features = encode_sae(hidden, sae)
+            feature_idx = int(features.abs().sum(dim=0).argmax())
+            feature_view = pd.DataFrame({
+                "position": range(features.shape[0]),
+                "feature": features[:, feature_idx].numpy(),
+            })
+            st.session_state["sae_loaded"] = (sae, hidden, feature_view, feature_idx)
+        except Exception as exc:
+            st.warning(f"SAE features unavailable: {type(exc).__name__}: {exc}")
+    sae_loaded = st.session_state.get("sae_loaded")
+    if sae_loaded:
+        sae, hidden, feature_view, feature_idx = sae_loaded
+        st.write(f"Validated SAE: layer {sae.layer}, {sae.feature_count} features; selected feature {feature_idx}")
+        st.plotly_chart(px.bar(feature_view, x="position", y="feature", title="Selected SAE feature activation"), width="stretch")
+        ablated_hidden = ablate_feature(hidden, sae, feature_idx)
+        st.write({
+            "feature": feature_idx,
+            "original_representation_norm": float(hidden.norm()),
+            "feature_ablated_representation_norm": float(ablated_hidden.norm()),
+        })
+        st.caption("SAE feature activation and ablation are model/artefact dependent; feature labels are not ground truth.")
+
+with tabs[11]:
+    page_intro(
+        "Validity analysis measures confidence, calibration, consistency, and sensitivity "
+        "against labels or explicitly constructed variants.",
+        "It helps determine when confidence is reliable and whether an answer changes under controlled prompt changes.",
+        "There is no single internal model operation that checks factual validity; correctness requires labels or references.",
+    )
+    st.subheader("Current prediction uncertainty")
+    if result is None or not current_analysis:
+        st.info("Run an analysis for the current prompt first.")
+    else:
+        uncertainty = prediction_uncertainty(result.logits[0, -1])
+        st.dataframe(pd.DataFrame([uncertainty]), width="stretch", hide_index=True)
+        st.caption("Confidence and low entropy are not evidence that the answer is factually correct.")
+
+    st.subheader("Calibration from labelled predictions")
+    st.caption("Enter one prediction per line as `confidence,correct`, where correct is 0 or 1.")
+    calibration_text = st.text_area(
+        "Prediction labels", "0.90,1\n0.80,1\n0.70,0\n0.60,1\n0.40,0", key="calibration_data"
+    )
+    if st.button("Calculate calibration"):
+        try:
+            pairs = [line.split(",") for line in calibration_text.splitlines() if line.strip()]
+            probabilities = [float(pair[0]) for pair in pairs]
+            labels = [int(pair[1]) for pair in pairs]
+            metrics, bins = calibration_metrics(probabilities, labels)
+            st.session_state["calibration_metrics"] = metrics
+            st.session_state["calibration_bins"] = bins
+        except Exception as exc:
+            st.error(f"Calibration failed: {type(exc).__name__}: {exc}")
+    if "calibration_metrics" in st.session_state:
+        calibration_summary = st.session_state["calibration_metrics"]
+        st.dataframe(pd.DataFrame([calibration_summary]), width="stretch", hide_index=True)
+        if calibration_summary["n_examples"] < 20:
+            st.warning("This calibration estimate uses fewer than 20 examples and may be unstable.")
+        if calibration_summary["accuracy"] != calibration_summary["majority_baseline"]:
+            st.caption("The majority baseline is included because class imbalance can make accuracy misleading.")
+        bins = st.session_state["calibration_bins"]
+        nonempty = bins[bins["count"] > 0]
+        figure = go.Figure()
+        figure.add_trace(go.Scatter(x=nonempty["confidence"], y=nonempty["accuracy"],
+                                    mode="lines+markers", name="Observed"))
+        figure.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Perfect calibration",
+                                    line={"dash": "dash"}))
+        figure.update_layout(xaxis_title="Mean confidence", yaxis_title="Accuracy")
+        st.plotly_chart(figure, width="stretch")
+
+    st.subheader("Explicit variant comparison")
+    st.caption("Enter `variant|prompt` lines. Variants are recorded exactly; agreement is not correctness.")
+    variants_text = st.text_area(
+        "Prompt variants", "baseline|The capital of France is\nmasked|The capital of ___ is", key="validity_variants"
+    )
+    if st.button("Run variant comparison"):
+        try:
+            records = []
+            reference_state = None
+            for line in variants_text.splitlines():
+                if not line.strip():
+                    continue
+                name, variant_prompt = line.split("|", 1)
+                variant_result = analyse(runtime, variant_prompt, max_length=max_length, with_attention=False)
+                metrics = prediction_uncertainty(variant_result.logits[0, -1])
+                state = variant_result.hidden_states[-1][0, -1]
+                if reference_state is None:
+                    reference_state = state
+                similarity = float(torch.nn.functional.cosine_similarity(
+                    state, reference_state, dim=0,
+                ))
+                records.append({
+                    "variant": name,
+                    "prompt": variant_prompt,
+                    "token": runtime.tokenizer.decode([metrics["top1_id"]], clean_up_tokenization_spaces=False),
+                    "probability": metrics["top1_probability"],
+                    "entropy": metrics["entropy"],
+                    "representation_similarity": similarity,
+                })
+            st.session_state["variant_comparison"] = compare_variants(records)
+        except Exception as exc:
+            st.error(f"Variant comparison failed: {type(exc).__name__}: {exc}")
+    if "variant_comparison" in st.session_state:
+        st.dataframe(st.session_state["variant_comparison"], width="stretch", hide_index=True)
+        variants = st.session_state["variant_comparison"]
+        if "representation_similarity" in variants:
+            st.plotly_chart(
+                px.bar(variants, x="variant", y="representation_similarity",
+                       labels={"representation_similarity": "Cosine similarity to first variant"}),
+                width="stretch",
+            )
+        st.warning("Variant agreement is a consistency signal, not a factuality guarantee.")
